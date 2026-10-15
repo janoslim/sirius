@@ -51,7 +51,9 @@ constexpr std::array<char const*, num_byte_counters> byte_names = {"chunk_bytes_
                                                                    "spill_write",
                                                                    "spill_read",
                                                                    "metadata_read",
-                                                                   "host_spill_write"};
+                                                                   "host_spill_write",
+                                                                   "spill_unread",
+                                                                   "spill_live_peak"};
 constexpr std::array<char const*, num_event_counters> event_names = {"row_groups_total",
                                                                      "row_groups_read",
                                                                      "pages_total",
@@ -197,6 +199,15 @@ void add_bytes(byte_counter counter, std::uint64_t bytes) noexcept
 {
   if (!state.active.load(std::memory_order_relaxed)) { return; }
   state.bytes[static_cast<std::size_t>(counter)].fetch_add(bytes, std::memory_order_relaxed);
+}
+
+void max_bytes(byte_counter counter, std::uint64_t bytes) noexcept
+{
+  if (!state.active.load(std::memory_order_relaxed)) { return; }
+  auto& value        = state.bytes[static_cast<std::size_t>(counter)];
+  std::uint64_t seen = value.load(std::memory_order_relaxed);
+  // compare_exchange_weak reloads `seen` on failure; stop once the stored value is not lower.
+  while (seen < bytes && !value.compare_exchange_weak(seen, bytes, std::memory_order_relaxed)) {}
 }
 
 void add_count(event_counter counter, std::uint64_t events) noexcept

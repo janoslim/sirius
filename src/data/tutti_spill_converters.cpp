@@ -221,6 +221,8 @@ tutti_spill_region tutti_spill_store::allocate(std::uint64_t bytes)
     auto const dir_index = (first_dir_index + step) % _dir_count;
     if (auto const region = allocate_in_dir(dir_index, bytes)) {
       _used_bytes += bytes;
+      // Peak live spill per query sizes the spill files (05_prealloc_spill.sh).
+      flowcsd::max_bytes(flowcsd::byte_counter::spill_live_peak, _used_bytes);
       return *region;
     }
   }
@@ -298,6 +300,14 @@ tutti_spill_representation::tutti_spill_representation(
 
 tutti_spill_representation::~tutti_spill_representation() noexcept
 {
+  // A batch dropped while still spilled was written to NVMe for nothing; make that visible.
+  if (_reads.load(std::memory_order_relaxed) == 0 && _region.size_bytes > 0) {
+    flowcsd::add_bytes(flowcsd::byte_counter::spill_unread, _region.size_bytes);
+    SIRIUS_LOG_INFO("[flowcsd] spill dropped unread {} B in {} at {}",
+                    _region.size_bytes,
+                    tutti_spill_store::instance().file_path(_region.file_index),
+                    _region.offset_bytes);
+  }
   tutti_spill_store::instance().release(_region);
 }
 
@@ -645,7 +655,12 @@ std::unique_ptr<cucascade::idata_representation> convert_tutti_spill_to_gpu(
       build_restored_column(columns[i], std::move(column_buffers[i]), stream, mr));
   }
   stream.sync();
+  spilled.mark_read();
   flowcsd::add_count(flowcsd::event_counter::restored_batches, 1);
+  SIRIUS_LOG_INFO("[flowcsd] spill read {} B from {} at {}",
+                  region.size_bytes,
+                  tutti_spill_store::instance().file_path(region.file_index),
+                  region.offset_bytes);
 
   // The representation records a writer event on `stream` for later cross-stream readers.
   return std::make_unique<cucascade::gpu_table_representation>(

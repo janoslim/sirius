@@ -52,6 +52,8 @@ enum class byte_counter : std::uint8_t {
   spill_read,            ///< bytes read back from NVMe by spill restore (incl. alignment padding)
   metadata_read,         ///< footer and page-index bytes read on the host
   host_spill_write,      ///< bytes the downgrade executor moved into the HOST tier (0 with direct spill)
+  spill_unread,          ///< spilled bytes whose batch was dropped before being read back
+  spill_live_peak,       ///< largest spill-store occupancy seen during the query (a maximum, not a sum)
   count
 };
 
@@ -69,6 +71,10 @@ enum class event_counter : std::uint8_t {
 
 /// Add to a byte counter of the running query (no-op outside a query).
 void add_bytes(byte_counter counter, std::uint64_t bytes) noexcept;
+
+/// Raise a byte counter of the running query to @p bytes if it is lower (for
+/// maxima such as spill_live_peak; no-op outside a query).
+void max_bytes(byte_counter counter, std::uint64_t bytes) noexcept;
 
 /// Add to an event counter of the running query (no-op outside a query).
 void add_count(event_counter counter, std::uint64_t events) noexcept;

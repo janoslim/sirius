@@ -29,6 +29,7 @@
 #include <cucascade/memory/column_metadata.hpp>
 #include <cucascade/memory/memory_space.hpp>
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <vector>
@@ -53,7 +54,7 @@ struct tutti_spill_region {
  * region length, and file_path is a synthetic `tutti-spill://<file>#<offset>` label that never
  * exists, so the base destructor's best-effort file removal deletes nothing.  Destroying this
  * representation (after a restore, or when the batch is dropped) returns the region to the
- * spill store.
+ * spill store; a batch dropped before any restore is logged and counted as spill_unread.
  */
 class tutti_spill_representation : public cucascade::disk_data_representation {
  public:
@@ -66,8 +67,12 @@ class tutti_spill_representation : public cucascade::disk_data_representation {
   /// Where the batch buffers live; column offsets in get_disk_table() are relative to it.
   [[nodiscard]] tutti_spill_region const& region() const noexcept { return _region; }
 
+  /// Called by the restore converter for every read of this batch back to the GPU.
+  void mark_read() const noexcept { _reads.fetch_add(1, std::memory_order_relaxed); }
+
  private:
   tutti_spill_region _region;
+  mutable std::atomic<std::uint32_t> _reads{0};  ///< restores so far
 };
 
 /**
