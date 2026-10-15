@@ -1104,6 +1104,13 @@ void sirius_physical_hash_join::discard_build_only_slots_if_probe_complete()
       {
         auto ro = batch->to_read_only();
         if (auto* ms = ro.get_memory_space(); ms != nullptr) { device_id = ms->get_device_id(); }
+        // FlowCSD: a dropped batch that is still spilled was written to NVMe for nothing.
+        if (ro.get_current_tier() == cucascade::memory::Tier::DISK) {
+          SIRIUS_LOG_INFO("[flowcsd] hash join {} discards spilled build batch {} (broadcast slot {})",
+                          this->get_operator_id(),
+                          batch->get_batch_id(),
+                          p);
+        }
       }
       std::optional<rmm::cuda_set_device_raii> device_guard;
       if (device_id >= 0) { device_guard.emplace(rmm::cuda_device_id{device_id}); }
@@ -1364,7 +1371,17 @@ std::pair<bool, bool> sirius_physical_hash_join::refresh_cross_schedule()
   if (probe_finished || build_finished) {
     for (auto const& d : collect_cross_schedule_discards(_cross, probe_finished, build_finished)) {
       auto* port = d.is_build ? build_port : probe_port;
-      port->repo->pop_data_batch_by_id(d.batch_id, d.partition);
+      auto batch = port->repo->pop_data_batch_by_id(d.batch_id, d.partition);
+      // FlowCSD: a fully-consumed batch that is still spilled was written to NVMe for nothing.
+      // try_to_read_only: never wait here on a lock held by a concurrent downgrade.
+      auto ro = batch ? batch->try_to_read_only() : std::nullopt;
+      if (ro && ro->get_current_tier() == cucascade::memory::Tier::DISK) {
+        SIRIUS_LOG_INFO("[flowcsd] hash join {} discards spilled {} batch {} (partition {})",
+                        this->get_operator_id(),
+                        d.is_build ? "build" : "probe",
+                        d.batch_id,
+                        d.partition);
+      }
     }
   }
 

@@ -86,6 +86,9 @@ class convertible_data_batch : public convertible_data {
     sirius::memory::sirius_memory_reservation_manager& res_mgr,
     bool blocking) override
   {
+    // FlowCSD: whether this candidate already held the batch's only reference (its repository
+    // dropped it after the downgrade snapshot); logged below when such a batch is converted.
+    bool const orphan_at_start = _batch.use_count() == 1;
     std::optional<cucascade::mutable_data_batch> mut_opt;
     if (blocking) {
       mut_opt.emplace(_batch->to_mutable());
@@ -148,6 +151,15 @@ class convertible_data_batch : public convertible_data {
         default: continue;
       }
 
+      // FlowCSD: two references left (this candidate and `mut`) means no repository or task holds
+      // the batch any more, so the conversion was wasted: the batch is freed with the candidate.
+      if (_batch.use_count() == 2) {
+        SIRIUS_LOG_INFO(
+          "[flowcsd] downgraded batch {} ({} B) that no repository holds (orphan before convert: {})",
+          _batch->get_batch_id(),
+          data_size,
+          orphan_at_start);
+      }
       // RAII: mutable_data_batch destructor releases the mutable lock and transitions back to idle
       // automatically.
       std::vector<std::size_t> bytes_per_target(target_spaces.size(), 0);
