@@ -22,6 +22,7 @@
 #include <cucascade/cudf/host_data_representation.hpp>
 #include <cucascade/data/representation_converter.hpp>
 #include <data/spill_chunked_converters.hpp>
+#include <data/tutti_spill_converters.hpp>
 #include <log/logging.hpp>
 
 #include <memory>
@@ -63,6 +64,7 @@ class converter_registry {
     cucascade::register_builtin_converters(*registry);
     sirius::register_compression_converters(*registry);
     sirius::spill::register_chunked_spill_converters(*registry, copy_chunk_bytes);
+    sirius::spill::register_tutti_spill_converters(*registry);
     copy_chunk_bytes_ = copy_chunk_bytes;
     instance_         = std::move(registry);
   }

@@ -22,6 +22,7 @@
 #include "io/rest/rest_ioctx.hpp"
 #include "io/rest/s3/sigv4_authorizer.hpp"
 #include "io/rest/s3/static_credentials.hpp"
+#include "io/tutti/tutti_ioctx.hpp"
 #include "io/uring/uring_ioctx.hpp"
 #include "log/logging.hpp"
 #include "scan_manager/config.hpp"
@@ -263,6 +264,18 @@ factory_type make_rest_ioctx_factory(
   };
 }
 
+factory_type make_tutti_ioctx_factory()
+{
+  return [](const scan_manager::scan_manager_config& /*config*/) -> std::shared_ptr<ioctx> {
+    try {
+      return std::make_shared<tutti::tutti_ioctx>();
+    } catch (const std::exception& e) {
+      SIRIUS_LOG_ERROR("make_tutti_ioctx_factory: construction failed: {}", e.what());
+      return nullptr;
+    }
+  };
+}
+
 // ---------------------------------------------------------------------------
 // datasource_registry
 // ---------------------------------------------------------------------------
@@ -288,6 +301,12 @@ io_context_registry::io_context_registry(
                    entry{io_context_type::restful,
                          &rest::rest_reactor::supports,
                          make_rest_ioctx_factory(_reservation_manager)});
+  // Tutti claims only the configured path prefixes; the rest keeps the routing above.
+  if (_config.backend == scan_manager::io_backend::tutti) {
+    _entries.emplace(
+      io_context_type::tutti,
+      entry{io_context_type::tutti, &tutti::tutti_ioctx::claims, make_tutti_ioctx_factory()});
+  }
 }
 
 void io_context_registry::register_ioctx(io_context_type type,
@@ -304,6 +323,12 @@ std::optional<io_context_type> io_context_registry::lookup_path(
   std::string_view path) const noexcept
 {
   std::shared_lock lk{_mtx};
+  // A Tutti path is a local file that uring's checker accepts too, so the more
+  // specific claim is asked first.
+  if (auto const tutti_entry = _entries.find(io_context_type::tutti);
+      tutti_entry != _entries.end() && tutti_entry->second.checker(path)) {
+    return io_context_type::tutti;
+  }
   // kvikio's checker matches everything; _entries iterates in unspecified order,
   // so defer the catch-all and let an explicit backend (uring/restful) win.
   std::optional<io_context_type> fallback;

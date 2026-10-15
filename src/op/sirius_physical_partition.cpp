@@ -19,6 +19,7 @@
 #include "config.hpp"
 #include "cudf/cudf_utils.hpp"
 #include "data/data_batch_utils.hpp"
+#include "flowcsd/flowcsd_stats.hpp"
 #include "log/logging.hpp"
 #include "memory/size_arithmetic.hpp"
 #include "op/partition/gpu_partition_impl.hpp"
@@ -506,6 +507,14 @@ void sirius_physical_partition::apply_partition_strategy(
   if (_sibling_partition_op != nullptr) {
     install(_sibling_partition_op->Cast<sirius_physical_partition>());
   }
+  // One count per consumer: the build and probe siblings share these partitions.
+  flowcsd::add_count(flowcsd::event_counter::hash_partitions,
+                     static_cast<std::uint64_t>(strategy.num_partitions));
+  SIRIUS_LOG_INFO("[flowcsd] partition id {} latched {} partitions (build_probe={}, broadcast={})",
+                  this->get_operator_id(),
+                  strategy.num_partitions,
+                  strategy.build_probe,
+                  strategy.broadcast);
 }
 
 std::optional<task_creation_hint> sirius_physical_partition::get_next_task_hint()

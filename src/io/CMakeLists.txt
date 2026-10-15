@@ -17,5 +17,7 @@ target_sources(
           s3/duckdb_secret_config.cpp
           s3/sirius_httpfs.cpp
           rest/s3/sigv4_authorizer.cpp
+          tutti/tutti_ioctx.cpp
+          tutti/tutti_service.cpp
           uring/uring_ioctx.cpp
           uring/uring_reactor.cpp)

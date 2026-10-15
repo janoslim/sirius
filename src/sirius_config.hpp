@@ -19,6 +19,7 @@
 #include "config.hpp"
 #include "creator/config.hpp"
 #include "exec/config.hpp"
+#include "flowcsd/flowcsd_config.hpp"
 #include "op/dynamic_filter/config.hpp"
 #include "scan_manager/config.hpp"
 
@@ -380,6 +381,12 @@ struct sirius_config {
     return _compression_config;
   }
 
+  /// FlowCSD study knobs (the @c sirius.flowcsd YAML block).
+  [[nodiscard]] const flowcsd::flowcsd_config& get_flowcsd_config() const noexcept
+  {
+    return _flowcsd_config;
+  }
+
   /// How many GPUs to allocate per query. 0 = use all active GPUs (default).
   /// Limits each query to the first @c gpus_per_query entries of the sorted
   /// active-GPU list; the rest are left available for future concurrent queries.
@@ -418,6 +425,7 @@ struct sirius_config {
   operator_params _operator_params;
   telemetry_config _telemetry_config;
   compression_config _compression_config;
+  flowcsd::flowcsd_config _flowcsd_config;
 };
 
 /// Validated configuration intent. Construction and parsing never discover hardware.

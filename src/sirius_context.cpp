@@ -895,6 +895,9 @@ void SiriusContext::initialize(const sirius::parsed_sirius_config& config)
     throw std::runtime_error("SiriusContext::initialize: no GPUs discovered");
   }
   config_ = config.resolve(discovery.get_topology());
+  // FlowCSD knobs are process-wide; install them before the converter registry, which
+  // registers the Tutti spill converters only when direct spill is configured.
+  sirius::flowcsd::install_config(config_.get_flowcsd_config());
   sirius::converter_registry::initialize(config_.get_downgrade_executor_config().copy_chunk_bytes);
 
   // Discovery is shared by all subsystems; execution GPU ids come from the

@@ -20,6 +20,7 @@
 #include "duckdb/main/connection.hpp"
 #include "duckdb/main/settings.hpp"
 #include "duckdb/parallel/thread_context.hpp"
+#include "flowcsd/flowcsd_stats.hpp"
 #include "io/sirius_datasource.hpp"
 #include "log/logging.hpp"
 #include "op/scan/iceberg_gpu_ingestible.hpp"
@@ -268,6 +269,8 @@ void sirius_engine::execute()
   }
   completion_handler_->execution_owner = std::this_thread::get_id();
   auto future                          = completion_handler_->get_awaitable();
+  // FlowCSD statistics cover execution from task submission to retirement.
+  flowcsd::begin_query(value_of(query_id_));
 
   plan_users_quiescent_ = false;
   // Create the query with the pipelines. It is owned here, alongside the plan it indexes.
@@ -294,16 +297,19 @@ void sirius_engine::execute()
     future.get();
     sirius_ctx->retire_query_work(query_id_,
                                   duckdb::SiriusContext::query_retirement_mode::completed);
+    flowcsd::end_query(value_of(query_id_), /*succeeded=*/true);
     finish_deferred_preparation(sirius_physical_plan.get());
     plan_users_quiescent_ = true;
   } catch (const std::exception& e) {
     SIRIUS_LOG_ERROR("Error executing query: {}", e.what());
+    flowcsd::end_query(value_of(query_id_), /*succeeded=*/false);
     cancel_dynamic_filter_publications();
     // Retire asynchronous borrowers before the execution window can release repositories.
     quiesce_plan_users();
     throw;
   } catch (...) {
     SIRIUS_LOG_ERROR("Unknown error executing query");
+    flowcsd::end_query(value_of(query_id_), /*succeeded=*/false);
     cancel_dynamic_filter_publications();
     quiesce_plan_users();
     throw;

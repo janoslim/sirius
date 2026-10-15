@@ -131,7 +131,9 @@ class io_context_registry {
   /// never resolves to kvikio and a local file routes to uring before the
   /// universal fallback.  When the registry was built with
   /// `backend: kvikio`, the uring local backend is suppressed so local
-  /// files fall through to kvikio.  std::nullopt when nothing matches.
+  /// files fall through to kvikio.  With `backend: tutti`, a path under one of
+  /// the Tutti prefixes resolves to tutti ahead of uring, whose checker also
+  /// accepts it.  std::nullopt when nothing matches.
   std::optional<io_context_type> lookup_path(std::string_view path) const noexcept;
 
   std::shared_ptr<ioctx> make_ioctx(io_context_type type) const noexcept;
@@ -190,5 +192,11 @@ io_context_registry::factory_type make_uring_ioctx_factory(
 /// configured (empty endpoint / credentials / region).
 io_context_registry::factory_type make_rest_ioctx_factory(
   cucascade::memory::memory_reservation_manager& reservation_manager);
+
+/// Tutti backend for the local paths under @c flowcsd_config::tutti_path_prefixes
+/// (registered only with `backend: tutti`).  Takes no reservation manager: every
+/// byte is staged in the Tutti service's registered GPU slabs, never in host
+/// memory.  Returns a null ioctx when the Tutti service cannot be started.
+io_context_registry::factory_type make_tutti_ioctx_factory();
 
 }  // namespace sirius::io

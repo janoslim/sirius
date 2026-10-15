@@ -98,6 +98,10 @@ enum class io_backend {
   sirius,
   /// The kvikIO backend (drives @c kvikio::FileHandle directly).
   kvikio,
+  /// The Sirius stack, except that local paths under
+  /// @c flowcsd_config::tutti_path_prefixes are read through Tutti
+  /// (GPU-initiated NVMe I/O) by @c io::tutti::tutti_ioctx.
+  tutti,
 };
 
 /// Parse a @ref io_backend from its lowercase YAML spelling.
@@ -106,6 +110,7 @@ inline bool string_to_enum(std::string_view sv, io_backend& out)
   static const std::unordered_map<std::string_view, io_backend> map = {
     {"sirius", io_backend::sirius},
     {"kvikio", io_backend::kvikio},
+    {"tutti", io_backend::tutti},
   };
   auto it = map.find(sv);
   if (it != map.end()) {
@@ -121,6 +126,7 @@ inline bool enum_to_string(io_backend b, std::string& s)
   switch (b) {
     case io_backend::sirius: s = "sirius"; return true;
     case io_backend::kvikio: s = "kvikio"; return true;
+    case io_backend::tutti: s = "tutti"; return true;
   }
   return false;
 }
@@ -190,7 +196,8 @@ struct memory_prefetcher_config {
  *
  * @c backend selects the IO stack: @ref io_backend::sirius routes local paths
  * to @c uring_ioctx and @c s3:// URLs to the REST backend, @ref io_backend::kvikio
- * routes local paths to @c kvikio_context. Reads go through
+ * routes local paths to @c kvikio_context, @ref io_backend::tutti routes like
+ * sirius except that the Tutti path prefixes go to @c tutti_ioctx. Reads go through
  * @c sirius_datasource either way; the kvikio backend drives
  * @c kvikio::FileHandle directly. Multi-GPU forces @ref io_backend::sirius.
  *

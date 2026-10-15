@@ -861,6 +861,11 @@ try {
     sirius::from_yaml(*n, settings._compression_config);
   }
 
+  // FlowCSD study knobs (Tutti backend, page skipping, direct spill, statistics)
+  if (auto n = r.optional_node("flowcsd")) {
+    flowcsd::flowcsd_config::from_yaml(*n, settings._flowcsd_config);
+  }
+
   // Explicit space configs (low-level API)
   if (auto space_node = r.optional_node("space")) {
     yaml::reader sr(*space_node, "sirius.space");

@@ -17,6 +17,7 @@
 #include "pipeline/gpu_pipeline_task.hpp"
 
 #include "cudf/cudf_utils.hpp"
+#include "flowcsd/flowcsd_stats.hpp"
 #include "helper/cuda_launch_error.hpp"
 #include "late_mat/port_materialize.hpp"
 #include "log/logging.hpp"
@@ -232,6 +233,16 @@ void synchronize_after_exception(::cuda::stream_ref stream, const sirius_pipelin
   }
 }
 
+/// FlowCSD latency category of one operator: PARTITION is the hash scatter of the out-of-core
+/// join/group-by; every other operator (including the scan's post-decode filter) is compute.
+/// The scan's NVMe read and decode intervals nest inside and win by attribution priority.
+flowcsd::time_category operator_time_category(op::sirius_physical_operator const& op)
+{
+  return op.type == op::SiriusPhysicalOperatorType::PARTITION
+           ? flowcsd::time_category::hash_partition
+           : flowcsd::time_category::compute;
+}
+
 std::unique_ptr<op::operator_data> run_one_operator(
   op::sirius_physical_operator& op,
   const op::operator_data& operator_input_data,
@@ -241,6 +252,7 @@ std::unique_ptr<op::operator_data> run_one_operator(
   size_t num_operators,
   cucascade::memory::reservation_aware_resource_adaptor* allocator)
 {
+  flowcsd::timed_scope operator_scope{operator_time_category(op)};
   log_operator_data(op, operator_input_data, pipeline, task_id, "executing on");
 
   auto nvtx_label = std::format(

@@ -38,7 +38,10 @@
 #include <cuda/stream>
 
 #include <memory>
+#include <mutex>
 #include <span>
+#include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace sirius::op::scan {
@@ -84,9 +87,33 @@ class column_chunk_range_cache {
   std::unique_ptr<cudf::io::parquet::experimental::hybrid_scan_reader> _reader;
 };
 
+/// Footers with their page index (ColumnIndex + OffsetIndex) set up, one per
+/// file, kept for the life of one scan: however many splits read a file, its
+/// page index is read from storage once per query.
+///
+/// Thread-safe: a scan's splits materialize concurrently.
+class page_index_cache {
+ public:
+  /// @p src's footer with its page index set up.  The first call for a file
+  /// reads the page index through @p src's datasource (one host read, counted
+  /// as flowcsd metadata_read); later and concurrent calls for the same file
+  /// share that load.  @p options builds the reader that parses the page index.
+  [[nodiscard]] std::shared_ptr<cudf::io::parquet::FileMetaData const> footer_with_page_index(
+    parquet_source const& src, cudf::io::parquet_reader_options const& options);
+
+ private:
+  struct entry {
+    std::once_flag loaded;
+    std::shared_ptr<cudf::io::parquet::FileMetaData const> footer;
+  };
+
+  std::mutex _mutex;  ///< guards _by_path; each entry's load is guarded by its own once_flag
+  std::unordered_map<std::string, std::shared_ptr<entry>> _by_path;
+};
+
 /// Materialize @p sources into one table.
 ///
-/// Takes one of two routes, picked from what the backend says it wants:
+/// Takes one of three routes, picked from what the backend says it wants:
 ///
 ///   bulk    - when every source's backend reports @c prefers_bulk_io().  Each
 ///             source's column chunks are read in a single vectored device
@@ -97,24 +124,34 @@ class column_chunk_range_cache {
 ///             instead of one per chunk, which is what makes this worth doing
 ///             against an object store.
 ///
+///   page skipping - the bulk route reading only the data pages that can hold
+///             a surviving row.  Taken instead of plain bulk when
+///             @p page_indexes is given, flowcsd page skipping is on,
+///             @p options carries a filter, and every source has a page index
+///             and a flat schema.  Filter columns are read first, pruned by the
+///             page statistics; payload columns second, pruned by the rows the
+///             filter kept.  Still one vectored request per file and step.
+///
 ///   general - otherwise.  cudf::io::read_parquet over the datasources and
 ///             their pre-parsed footers, which reads as it decodes.
 ///
-/// Both routes honor @p options' row filter: @c materialize_all_columns applies
-/// it at row level exactly as @c read_parquet does, so the route never changes
-/// which rows come back.  With the reader options Sirius uses, both routes
-/// also refuse sources whose schemas differ.
+/// Every route honors @p options' row filter at row level exactly as
+/// @c read_parquet does, so the route never changes which rows come back.
+/// With the reader options Sirius uses, every route also refuses sources whose
+/// schemas differ.  The bulk routes record the flowcsd scan counters.
 ///
 /// @param ranges  column-chunk ranges, one vector per entry of @p sources and in
-///                the same order.  Only read on the bulk route; any source whose
-///                entry is missing or empty has its ranges derived from the
-///                metadata.  Pass an empty span to derive them all.
+///                the same order.  Only read on the plain bulk route; any source
+///                whose entry is missing or empty has its ranges derived from
+///                the metadata.  Pass an empty span to derive them all.
+/// @param page_indexes  the scan's page-index cache; null keeps whole chunks.
 [[nodiscard]] std::unique_ptr<cudf::table> materialize_parquet(
   std::span<parquet_source const> sources,
   cudf::io::parquet_reader_options const& options,
   std::span<std::vector<cudf::io::text::byte_range_info> const> ranges,
   ::cuda::stream_ref stream,
-  rmm::device_async_resource_ref mr);
+  rmm::device_async_resource_ref mr,
+  page_index_cache* page_indexes = nullptr);
 
 /// Whether @c materialize_parquet would take the bulk route for @p sources and
 /// @p options.  Exposed so a caller can decide *before* paying to build the

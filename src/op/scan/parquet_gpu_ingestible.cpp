@@ -23,6 +23,7 @@
 #include <expression/ast/from_duckdb.hpp>
 #include <expression_evaluator/expression_evaluator.hpp>
 #include <expression_evaluator/gpu_expression_translator_internal.hpp>
+#include <flowcsd/flowcsd_stats.hpp>
 #include <helper/type_conversions.hpp>
 #include <io/io_context.hpp>
 #include <io/io_errors.hpp>
@@ -1298,6 +1299,9 @@ std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
     }
   }
 
+  // flowcsd row_groups_total: every footer row group, once per file of this scan
+  // (this metadata scan runs once per file).
+  flowcsd::add_count(flowcsd::event_counter::row_groups_total, metadata.row_groups.size());
   auto row_group_indices = reader.all_row_groups(opts);
   // Virtual columns are not available to the reader, but physical footer pruning is.
   if (ast_expression) {
@@ -1781,7 +1785,8 @@ filtered_table parquet_gpu_ingestible::materialize_metadata_to_table(
         _info->profiles->counters->reader_call(slice.file_path);
     bool const bulk = !all_slices_pruned && prefers_bulk_materialize(sources, opts);
     if (bulk) {
-      table = materialize_parquet(sources, opts, split.column_chunk_byte_ranges(), stream, mr_ref);
+      table = materialize_parquet(
+        sources, opts, split.column_chunk_byte_ranges(), stream, mr_ref, &_page_indexes);
     } else {
       std::vector<std::unique_ptr<cudf::io::datasource>> cudf_sources;
       std::vector<cudf::io::parquet::FileMetaData> metadatas;

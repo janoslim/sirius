@@ -20,6 +20,7 @@
 #include <helper/logical_type.hpp>
 #include <memory/size_arithmetic.hpp>
 #include <op/scan/gpu_ingestible.hpp>
+#include <op/scan/parquet_materialize.hpp>
 #include <op/scan/row_group_metadata.hpp>  // row_group_slice + hybrid_scan_reader
 #include <op/scan/scan_plan.hpp>
 #include <op/scan/table_scan/parquet_physical_profile.hpp>
@@ -425,6 +426,9 @@ class parquet_gpu_ingestible : public gpu_ingestible {
   // The same options without a column projection: stamped onto files whose
   // carrier column is unavailable (parquet_file_scan_info::carrier_unavailable).
   std::shared_ptr<cudf::io::parquet_reader_options> _natural_reader_options;
+  // Footers with their page index, loaded at most once per file for this scan
+  // (one ingestible per query) and shared by every split's page-skipping read.
+  page_index_cache _page_indexes;
   // Coalesced DuckDB filter expression. Empty when no filters survived the
   // partition-column drop pass.
   std::shared_ptr<duckdb::Expression> _duckdb_filter_expression;

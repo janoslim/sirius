@@ -29,6 +29,7 @@
 #include "io/rest/rest_ioctx.hpp"
 #include "io/s3/duckdb_secret_config.hpp"
 #include "io/sirius_datasource.hpp"
+#include "io/tutti/tutti_service.hpp"
 #include "io/uri_parser.hpp"
 #include "late_mat/pin_uniqueness.hpp"
 #include "log/logging.hpp"
@@ -134,9 +135,10 @@ prefetch_strategy backend_prefetch_strategy(io::io_context_type type) noexcept
   switch (type) {
     case io::io_context_type::restful: return prefetch_strategy::eager;
     case io::io_context_type::uring: return prefetch_strategy::opportunistic;
-    // kvikio never reaches here: it cannot use the prefetching cache, so
-    // prepare_for_query excludes it before backend selection.
-    case io::io_context_type::kvikio: break;
+    // kvikio and tutti never reach here: they cannot use the prefetching cache,
+    // so prepare_for_query excludes them before backend selection.
+    case io::io_context_type::kvikio:
+    case io::io_context_type::tutti: break;
   }
   return prefetch_strategy::eager;
 }
@@ -1355,7 +1357,17 @@ sirius_scan_manager::sirius_scan_manager(
   // path is identical from the caller's point of view.  Both are built by the
   // ioctx registry, which sources the reactor staging resource from the
   // reservation manager it was constructed with.
-  if (_config.backend == scan_manager::io_backend::sirius) {
+  // backend=tutti keeps uring as the default io_ctx for every path outside the
+  // Tutti prefixes; ioctx_for_path sends the prefixed paths to a tutti_ioctx
+  // (io_context_registry::lookup_path).  Fail here rather than on the first scan.
+  if (_config.backend == scan_manager::io_backend::tutti &&
+      !sirius::io::tutti::tutti_service::configured()) {
+    throw std::runtime_error(
+      "[sirius_scan_manager] backend=tutti needs sirius.flowcsd.tutti_runtime_config and a "
+      "Sirius built with SIRIUS_TUTTI_BRIDGE_DIR");
+  }
+  if (_config.backend == scan_manager::io_backend::sirius ||
+      _config.backend == scan_manager::io_backend::tutti) {
     _io_ctx = _ioctx_registry.make_ioctx(sirius::io::io_context_type::uring);
     if (!_io_ctx) {
       throw std::runtime_error("[sirius_scan_manager] failed to create uring io_context");

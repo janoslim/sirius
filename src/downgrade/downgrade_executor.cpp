@@ -20,6 +20,7 @@
 #include "data/convertible_data_batch.hpp"
 #include "data/convertible_gpu_pipeline_task.hpp"
 #include "downgrade/spill_policy.hpp"
+#include "flowcsd/flowcsd_config.hpp"
 #include "log/logging.hpp"
 
 #include <nvtx3/nvtx3.hpp>
@@ -177,11 +178,13 @@ void downgrade_executor::processing_loop()
     auto* source_space = _reservation_manager.get_memory_space(_space_id.tier, _space_id.device_id);
 
     // Build target spaces list: for GPU->HOST downgrade, target is HOST tier followed by DISK tier.
+    // FlowCSD direct disk spill skips the HOST tier: GPU batches go straight to DISK, where the
+    // Tutti spill converters write them GPU -> NVMe (data/tutti_spill_converters.hpp).
     // NUMA preference (from downgrade_executor_config, v1.0 dd86dd0 intent re-authored on the
     // post-#637 architecture): if preferred_numa_node is set, stable_partition the matching HOST
     // space(s) to the front of target_spaces so cand->convert() tries the NUMA-local space first.
     std::vector<const cucascade::memory::memory_space*> target_spaces;
-    if (_space_id.tier == cucascade::memory::Tier::GPU) {
+    if (_space_id.tier == cucascade::memory::Tier::GPU && !flowcsd::config().direct_disk_spill) {
       auto host_span =
         _reservation_manager.get_memory_spaces_for_tier(cucascade::memory::Tier::HOST);
       // Copy span -> vector before reordering: the span is a view into the manager's
@@ -538,6 +541,10 @@ bool downgrade_executor::has_viable_downgrade_target() const
 
   // DISK is an effectively unbounded sink and a valid target for any source tier.
   if (has_disk_tier()) { return true; }
+
+  // FlowCSD direct disk spill never targets HOST (processing_loop skips it), so without a DISK
+  // tier nothing is viable.
+  if (flowcsd::config().direct_disk_spill) { return false; }
 
   // Without a disk tier, only a GPU source has a lower tier to downgrade to (HOST). processing_loop
   // only adds HOST target spaces when the source is GPU, so a HOST (or other) source has no target
