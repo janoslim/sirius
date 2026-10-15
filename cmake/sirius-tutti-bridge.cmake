@@ -27,9 +27,15 @@ if(SIRIUS_TUTTI_BRIDGE_DIR)
   endif()
   message(STATUS "Sirius: linking the Tutti bridge ${_sirius_tutti_bridge_library}")
 
-  # Only io/tutti/tutti_service.cpp includes the bridge header.
-  target_include_directories(sirius_objects PRIVATE "${SIRIUS_TUTTI_BRIDGE_DIR}")
-  target_compile_definitions(sirius_objects PRIVATE SIRIUS_WITH_TUTTI=1)
+  # Only io/tutti/tutti_service.cpp includes the bridge header.  Scoping the
+  # define and include directory to that one file leaves the flags of every
+  # other sirius_objects source unchanged, so turning the bridge on or off
+  # recompiles one file instead of the whole library.
+  set_source_files_properties(
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/io/tutti/tutti_service.cpp"
+    TARGET_DIRECTORY sirius_objects
+    PROPERTIES COMPILE_DEFINITIONS SIRIUS_WITH_TUTTI=1
+               INCLUDE_DIRECTORIES "${SIRIUS_TUTTI_BRIDGE_DIR}")
 
   # Both final libraries carry sirius_objects; the archive passes the bridge on
   # to whatever links it (the unit tests and benchmarks).
