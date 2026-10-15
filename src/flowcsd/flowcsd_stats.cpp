@@ -50,7 +50,8 @@ constexpr std::array<char const*, num_byte_counters> byte_names = {"chunk_bytes_
                                                                    "decoded_materialized",
                                                                    "spill_write",
                                                                    "spill_read",
-                                                                   "metadata_read"};
+                                                                   "metadata_read",
+                                                                   "host_spill_write"};
 constexpr std::array<char const*, num_event_counters> event_names = {"row_groups_total",
                                                                      "row_groups_read",
                                                                      "pages_total",

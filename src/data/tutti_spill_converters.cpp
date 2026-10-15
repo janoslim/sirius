@@ -444,13 +444,21 @@ std::unique_ptr<cucascade::idata_representation> convert_gpu_to_tutti_spill(
       table.column(i), disk_columns[static_cast<std::size_t>(i)], region.offset_bytes, writes);
   }
   stream.sync();
+  std::uint64_t issued_bytes = 0;
   if (!writes.empty()) {
     auto const transfer = io::tutti::tutti_service::instance().write(
       region.file_id, writes, io::tutti::staging_pool::spill, stream.get());
+    issued_bytes = transfer.issued_bytes;
     flowcsd::add_bytes(flowcsd::byte_counter::spill_write, transfer.issued_bytes);
     flowcsd::add_count(flowcsd::event_counter::io_requests, transfer.requests);
   }
   flowcsd::add_count(flowcsd::event_counter::spilled_batches, 1);
+  // One line per batch: shows which drive (spill dir) every spill went to.
+  SIRIUS_LOG_INFO("[flowcsd] spill write {} B ({} rows) to {} at {}",
+                  issued_bytes,
+                  table.num_rows(),
+                  store.file_path(region.file_index),
+                  region.offset_bytes);
   return spilled;
 }
 

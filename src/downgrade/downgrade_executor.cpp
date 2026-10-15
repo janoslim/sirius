@@ -21,6 +21,7 @@
 #include "data/convertible_gpu_pipeline_task.hpp"
 #include "downgrade/spill_policy.hpp"
 #include "flowcsd/flowcsd_config.hpp"
+#include "flowcsd/flowcsd_stats.hpp"
 #include "log/logging.hpp"
 
 #include <nvtx3/nvtx3.hpp>
@@ -361,6 +362,7 @@ void downgrade_executor::processing_loop()
                     if (i < host_end_idx) {
                       host_target_stats.batches.fetch_add(1, std::memory_order_relaxed);
                       host_target_stats.bytes.fetch_add((*result)[i], std::memory_order_relaxed);
+                      flowcsd::add_bytes(flowcsd::byte_counter::host_spill_write, (*result)[i]);
                     } else {
                       disk_target_stats.batches.fetch_add(1, std::memory_order_relaxed);
                       disk_target_stats.bytes.fetch_add((*result)[i], std::memory_order_relaxed);
@@ -444,6 +446,8 @@ void downgrade_executor::processing_loop()
                   if (i < host_end_idx) {
                     host_target_stats.batches.fetch_add(1, std::memory_order_relaxed);
                     host_target_stats.bytes.fetch_add((*result)[i], std::memory_order_relaxed);
+                    // FlowCSD: shows the upstream GPU->HOST spill path was (not) taken.
+                    flowcsd::add_bytes(flowcsd::byte_counter::host_spill_write, (*result)[i]);
                   } else {
                     disk_target_stats.batches.fetch_add(1, std::memory_order_relaxed);
                     disk_target_stats.bytes.fetch_add((*result)[i], std::memory_order_relaxed);

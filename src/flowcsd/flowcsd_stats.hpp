@@ -51,6 +51,7 @@ enum class byte_counter : std::uint8_t {
   spill_write,           ///< bytes written to NVMe by direct spill (incl. alignment padding)
   spill_read,            ///< bytes read back from NVMe by spill restore (incl. alignment padding)
   metadata_read,         ///< footer and page-index bytes read on the host
+  host_spill_write,      ///< bytes the downgrade executor moved into the HOST tier (0 with direct spill)
   count
 };
 
