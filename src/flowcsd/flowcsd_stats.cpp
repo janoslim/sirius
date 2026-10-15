@@ -25,6 +25,7 @@
 #include <cstdlib>
 #include <format>
 #include <fstream>
+#include <map>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -74,8 +75,9 @@ struct query_state {
   steady_clock::time_point start;
   std::array<std::atomic<std::uint64_t>, num_byte_counters> bytes{};
   std::array<std::atomic<std::uint64_t>, num_event_counters> events{};
-  std::mutex intervals_mutex;
+  std::mutex intervals_mutex;  ///< guards intervals and columns
   std::vector<interval> intervals;
+  std::map<std::string, column_scan_counters> columns;  ///< by "table.column"
 };
 
 query_state state;
@@ -161,6 +163,24 @@ std::string json_counters(Counters const& counters, Names const& names)
   return text + "}";
 }
 
+/// `"table.column": {...}` entries of the per-column scan breakdown.
+std::string json_columns(std::map<std::string, column_scan_counters> const& columns)
+{
+  std::string text = "{";
+  for (auto const& [key, c] : columns) {
+    if (text.size() > 1) { text += ", "; }
+    text += std::format(
+      "\"{}\": {{\"chunk_bytes_full\": {}, \"nvme_read_requested\": {}, \"pages_total\": {}, "
+      "\"pages_read\": {}}}",
+      key,
+      c.chunk_bytes_full,
+      c.nvme_read_requested,
+      c.pages_total,
+      c.pages_read);
+  }
+  return text + "}";
+}
+
 /// Where the JSON lines go: $FLOWCSD_STATS_JSONL, else the config, else nowhere.
 std::string stats_path()
 {
@@ -182,6 +202,17 @@ void add_count(event_counter counter, std::uint64_t events) noexcept
 {
   if (!state.active.load(std::memory_order_relaxed)) { return; }
   state.events[static_cast<std::size_t>(counter)].fetch_add(events, std::memory_order_relaxed);
+}
+
+void add_column_scan(std::string const& key, column_scan_counters const& counters)
+{
+  if (!state.active.load(std::memory_order_relaxed)) { return; }
+  std::lock_guard lock(state.intervals_mutex);
+  auto& total = state.columns[key];
+  total.chunk_bytes_full += counters.chunk_bytes_full;
+  total.nvme_read_requested += counters.nvme_read_requested;
+  total.pages_total += counters.pages_total;
+  total.pages_read += counters.pages_read;
 }
 
 timed_scope::timed_scope(time_category category) noexcept
@@ -206,6 +237,7 @@ void begin_query(std::uint64_t query_id)
 {
   std::lock_guard lock(state.intervals_mutex);
   state.intervals.clear();
+  state.columns.clear();
   for (auto& b : state.bytes) {
     b.store(0, std::memory_order_relaxed);
   }
@@ -221,6 +253,7 @@ void end_query(std::uint64_t query_id, bool succeeded)
 {
   // Stop collecting first so late scopes (e.g. a background spill) cannot race the sweep.
   std::vector<interval> intervals;
+  std::map<std::string, column_scan_counters> columns;
   std::int64_t wall_ns = 0;
   {
     std::lock_guard lock(state.intervals_mutex);
@@ -229,6 +262,7 @@ void end_query(std::uint64_t query_id, bool succeeded)
     wall_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(steady_clock::now() - state.start)
                 .count();
     intervals.swap(state.intervals);
+    columns.swap(state.columns);
   }
 
   auto const path = stats_path();
@@ -243,7 +277,7 @@ void end_query(std::uint64_t query_id, bool succeeded)
   auto const& cfg  = config();
   std::string line = std::format(
     "{{\"query_id\": {}, \"ok\": {}, \"wall_ms\": {:.3f}, \"time_ms\": {}, \"union_ms\": {}, "
-    "\"busy_ms\": {}, \"bytes\": {}, \"counts\": {}, \"intervals\": {}, "
+    "\"busy_ms\": {}, \"bytes\": {}, \"counts\": {}, \"columns\": {}, \"intervals\": {}, "
     "\"flowcsd\": {{\"tutti\": {}, \"page_skipping\": {}, \"direct_disk_spill\": {}}}}}\n",
     query_id,
     succeeded ? "true" : "false",
@@ -253,6 +287,7 @@ void end_query(std::uint64_t query_id, bool succeeded)
     json_object(breakdown.busy_ns, time_names, ns_per_ms),
     json_counters(state.bytes, byte_names),
     json_counters(state.events, event_names),
+    json_columns(columns),
     intervals.size(),
     cfg.tutti_runtime_config.empty() ? "false" : "true",
     cfg.page_skipping ? "true" : "false",

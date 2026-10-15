@@ -114,6 +114,9 @@ size_t direct_host_read(tutti_io_object const& file, size_t offset, size_t size,
     }
     filled += static_cast<size_t>(result);
   }
+  // metadata_read counts what the kernel read (whole blocks), so it can be checked
+  // against the block-layer counters of the Tutti SSDs.
+  flowcsd::add_bytes(flowcsd::byte_counter::metadata_read, filled);
   std::memcpy(dst, bounce.get() + (offset - aligned_begin), size);
   return size;
 }

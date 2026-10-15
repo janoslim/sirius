@@ -28,6 +28,7 @@
 
 #include <chrono>
 #include <cstdint>
+#include <string>
 
 namespace sirius::flowcsd {
 
@@ -70,6 +71,19 @@ void add_bytes(byte_counter counter, std::uint64_t bytes) noexcept;
 
 /// Add to an event counter of the running query (no-op outside a query).
 void add_count(event_counter counter, std::uint64_t events) noexcept;
+
+/// Scan counters of one (table, column) pair, the byte_counter/event_counter
+/// totals broken down so they can be compared with a per-column page oracle.
+struct column_scan_counters {
+  std::uint64_t chunk_bytes_full{0};     ///< whole column chunks of the selected row groups
+  std::uint64_t nvme_read_requested{0};  ///< bytes requested after page skipping
+  std::uint64_t pages_total{0};          ///< data pages of those chunks
+  std::uint64_t pages_read{0};           ///< data pages read after page skipping
+};
+
+/// Add to the per-column breakdown of the running query under @p key
+/// ("table.column"); no-op outside a query.
+void add_column_scan(std::string const& key, column_scan_counters const& counters);
 
 /// Records the interval [construction, destruction) under one category.
 class timed_scope {

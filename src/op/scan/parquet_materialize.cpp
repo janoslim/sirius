@@ -33,6 +33,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <filesystem>
 #include <iterator>
 #include <optional>
 #include <stdexcept>
@@ -127,31 +128,38 @@ std::string path_of(parquet_source const& src)
   return src.datasource ? src.datasource->get_io_object().object_path() : std::string{"<unknown>"};
 }
 
-/// Per output column, what flowcsd decoded_materialized needs.
+/// Per output column, what flowcsd decoded_materialized and the per-column
+/// scan breakdown need.
 struct column_accounting {
   std::int64_t rows_decoded       = 0;  ///< rows in the data pages cuDF decodes
   std::int64_t uncompressed_bytes = 0;  ///< encoded size of the column's chunks (width fallback)
   std::int64_t values             = 0;  ///< values in the column's chunks (width fallback)
+  flowcsd::column_scan_counters scan;   ///< chunk / requested bytes and pages of this column
 };
 
 /// What one materialize call read.  Recorded into the flowcsd counters once the
 /// output table exists (@ref record_scan_counters).
 struct read_accounting {
-  std::uint64_t chunk_bytes     = 0;  ///< whole selected column chunks
-  std::uint64_t requested_bytes = 0;  ///< bytes asked of the datasources
-  std::uint64_t pages_total     = 0;  ///< data pages of the selected chunks
-  std::uint64_t pages_read      = 0;  ///< data pages read
   std::unordered_map<std::string, column_accounting> columns;  ///< by top-level column name
 
-  /// Count @p chunk as selected, @p rows_decoded of its rows in pages cuDF decodes.
-  void add_chunk(ColumnChunk const& chunk, std::int64_t rows_decoded)
+  /// Count @p chunk as selected: @p rows_decoded of its rows lie in pages cuDF
+  /// decodes, @p requested_bytes of it were asked of the datasource, and
+  /// @p pages_read of its @p pages_total data pages were read.
+  void add_chunk(ColumnChunk const& chunk,
+                 std::int64_t rows_decoded,
+                 std::uint64_t requested_bytes,
+                 std::uint64_t pages_total,
+                 std::uint64_t pages_read)
   {
     auto const& meta = chunk.meta_data;
     auto& column     = columns[meta.path_in_schema.front()];
-    chunk_bytes += static_cast<std::uint64_t>(meta.total_compressed_size);
     column.rows_decoded += rows_decoded;
     column.uncompressed_bytes += meta.total_uncompressed_size;
     column.values += meta.num_values;
+    column.scan.chunk_bytes_full += static_cast<std::uint64_t>(meta.total_compressed_size);
+    column.scan.nvme_read_requested += requested_bytes;
+    column.scan.pages_total += pages_total;
+    column.scan.pages_read += pages_read;
   }
 };
 
@@ -286,11 +294,17 @@ void record_scan_counters(read_accounting const& accounting,
     decoded_bytes += static_cast<double>(found->second.rows_decoded) * bytes_per_row;
   }
 
-  flowcsd::add_bytes(byte_counter::chunk_bytes_full, accounting.chunk_bytes);
-  flowcsd::add_bytes(byte_counter::nvme_read_requested, accounting.requested_bytes);
+  // Totals and the per-(table, column) breakdown.  The study's layout keeps one
+  // table per directory ({table}/{table}-NNNNN.parquet), so the directory names it.
+  auto const table = std::filesystem::path(path_of(sources.front())).parent_path().filename();
+  for (auto const& [name, column] : accounting.columns) {
+    flowcsd::add_bytes(byte_counter::chunk_bytes_full, column.scan.chunk_bytes_full);
+    flowcsd::add_bytes(byte_counter::nvme_read_requested, column.scan.nvme_read_requested);
+    flowcsd::add_count(event_counter::pages_total, column.scan.pages_total);
+    flowcsd::add_count(event_counter::pages_read, column.scan.pages_read);
+    flowcsd::add_column_scan(table.string() + "." + name, column.scan);
+  }
   flowcsd::add_bytes(byte_counter::decoded_materialized, static_cast<std::uint64_t>(decoded_bytes));
-  flowcsd::add_count(event_counter::pages_total, accounting.pages_total);
-  flowcsd::add_count(event_counter::pages_read, accounting.pages_read);
   flowcsd::add_count(event_counter::row_groups_read, row_groups);
 }
 
@@ -339,10 +353,8 @@ fetched_chunks fetch_chunks(parquet_source const& src,
   // The row-mask fields of the located chunks are unused here: this route has no row mask.
   for (auto const& located : locate_chunks(*src.metadata, src.row_group_indices, ranges, 0, 0)) {
     auto const pages = data_page_count(located.chunk->meta_data);
-    accounting.add_chunk(*located.chunk, located.num_rows);
-    accounting.requested_bytes += located.size;
-    accounting.pages_total += pages;
-    accounting.pages_read += pages;
+    accounting.add_chunk(
+      *located.chunk, located.num_rows, static_cast<std::uint64_t>(located.size), pages, pages);
   }
 
   fetched_chunks out;
@@ -543,7 +555,6 @@ std::shared_ptr<FileMetaData const> load_page_index(parquet_source const& src,
     src.datasource->host_read(static_cast<std::size_t>(range.offset()), bytes.size(), bytes.data());
   CUDF_EXPECTS(bytes_read == bytes.size(),
                "[parquet_materialize] short page index read from " + path_of(src));
-  flowcsd::add_bytes(flowcsd::byte_counter::metadata_read, bytes.size());
 
   reader.setup_page_index(cudf::host_span<std::uint8_t const>(bytes.data(), bytes.size()));
   return std::make_shared<FileMetaData const>(reader.parquet_metadata());
@@ -866,16 +877,14 @@ fetched_chunks fetch_surviving_pages(std::span<parquet_source const> sources,
   // Which data pages hold a surviving row.
   auto const pages     = page_row_ranges(chunks);
   auto const surviving = pages_with_surviving_rows(row_mask, pages, stream, mr);
-  auto const pages_read =
-    static_cast<std::uint64_t>(std::count(surviving.begin(), surviving.end(), true));
-  accounting.pages_total += pages.size();
-  accounting.pages_read += pages_read;
+  auto const pages_read = std::count(surviving.begin(), surviving.end(), true);
 
   // No page survives, so every row is pruned: cuDF then returns an empty table
   // without touching chunk data (hybrid_scan_impl.cpp:527-535, 565-573).
   if (pages_read == 0) {
     for (auto const& chunk : chunks) {
-      accounting.add_chunk(*chunk.chunk, 0);
+      auto const chunk_pages = chunk.chunk->offset_index.value().page_locations.size();
+      accounting.add_chunk(*chunk.chunk, 0, 0, chunk_pages, 0);
     }
     return {};
   }
@@ -887,16 +896,24 @@ fetched_chunks fetch_surviving_pages(std::span<parquet_source const> sources,
   chunk_fill_plan plan{std::vector<std::vector<io::slice>>(sources.size()), {}};
   std::size_t first_page = 0;
   for (std::size_t c = 0; c < chunks.size(); ++c) {
-    auto* const buffer = static_cast<std::uint8_t*>(out.buffers[c].data());
-    auto const rows_decoded =
-      plan_chunk_fill(chunks[c], buffer, pages, surviving, first_page, plan);
-    accounting.add_chunk(*chunks[c].chunk, rows_decoded);
-    first_page += chunks[c].chunk->offset_index.value().page_locations.size();
-  }
-  for (auto const& reads : plan.reads_per_source) {
-    for (auto const& read : reads) {
-      accounting.requested_bytes += read.size();
+    auto* const buffer        = static_cast<std::uint8_t*>(out.buffers[c].data());
+    auto const& source_reads  = plan.reads_per_source[chunks[c].source];
+    auto const reads_before   = source_reads.size();
+    auto const rows_decoded   = plan_chunk_fill(chunks[c], buffer, pages, surviving, first_page, plan);
+    std::uint64_t chunk_bytes = 0;  // what this chunk asks of the datasource
+    for (auto r = reads_before; r < source_reads.size(); ++r) {
+      chunk_bytes += source_reads[r].size();
     }
+    auto const chunk_pages = chunks[c].chunk->offset_index.value().page_locations.size();
+    auto const chunk_first = surviving.begin() + static_cast<std::ptrdiff_t>(first_page);
+    auto const chunk_read =
+      std::count(chunk_first, chunk_first + static_cast<std::ptrdiff_t>(chunk_pages), true);
+    accounting.add_chunk(*chunks[c].chunk,
+                         rows_decoded,
+                         chunk_bytes,
+                         chunk_pages,
+                         static_cast<std::uint64_t>(chunk_read));
+    first_page += chunk_pages;
   }
 
   // Headers and reads fill disjoint bytes of the buffers, so either may go first.
