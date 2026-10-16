@@ -424,6 +424,10 @@ std::unique_ptr<cucascade::idata_representation> convert_gpu_to_tutti_spill(
   auto& store = tutti_spill_store::instance();
   flowcsd::timed_scope spill_timer{flowcsd::time_category::spill_write};
   nvtx3::scoped_range nvtx_range{"sirius::spill::gpu_to_tutti"};
+  // Trace: everything before the Tutti write -- waiting for the batch's producer kernels
+  // (the stream.sync below), planning the layout and taking a region.
+  std::optional<flowcsd::trace_scope> prepare_trace{std::in_place,
+                                                    flowcsd::trace_category::spill_w_prepare};
   auto& gpu_source             = source.cast<cucascade::gpu_table_representation>();
   cudf::table_view const table = gpu_source.get_table_view();
 
@@ -454,6 +458,7 @@ std::unique_ptr<cucascade::idata_representation> convert_gpu_to_tutti_spill(
       table.column(i), disk_columns[static_cast<std::size_t>(i)], region.offset_bytes, writes);
   }
   stream.sync();
+  prepare_trace.reset();
   std::uint64_t issued_bytes = 0;
   if (!writes.empty()) {
     auto const transfer = io::tutti::tutti_service::instance().write(
@@ -637,8 +642,12 @@ std::unique_ptr<cucascade::idata_representation> convert_tutti_spill_to_gpu(
   std::vector<io::tutti::device_read> reads;
   std::vector<restored_buffers> column_buffers;
   column_buffers.reserve(columns.size());
-  for (auto const& meta : columns) {
-    column_buffers.push_back(allocate_column_buffers(meta, region.offset_bytes, stream, mr, reads));
+  {
+    flowcsd::trace_scope const prepare_trace{flowcsd::trace_category::spill_r_prepare};
+    for (auto const& meta : columns) {
+      column_buffers.push_back(
+        allocate_column_buffers(meta, region.offset_bytes, stream, mr, reads));
+    }
   }
   if (!reads.empty()) {
     auto const transfer = io::tutti::tutti_service::instance().read(
@@ -650,11 +659,14 @@ std::unique_ptr<cucascade::idata_representation> convert_tutti_spill_to_gpu(
   // Rebuild the cudf columns from the filled buffers.
   std::vector<std::unique_ptr<cudf::column>> gpu_columns;
   gpu_columns.reserve(columns.size());
-  for (std::size_t i = 0; i < columns.size(); ++i) {
-    gpu_columns.push_back(
-      build_restored_column(columns[i], std::move(column_buffers[i]), stream, mr));
+  {
+    flowcsd::trace_scope const unpack_trace{flowcsd::trace_category::spill_r_unpack};
+    for (std::size_t i = 0; i < columns.size(); ++i) {
+      gpu_columns.push_back(
+        build_restored_column(columns[i], std::move(column_buffers[i]), stream, mr));
+    }
+    stream.sync();
   }
-  stream.sync();
   spilled.mark_read();
   flowcsd::add_count(flowcsd::event_counter::restored_batches, 1);
   SIRIUS_LOG_INFO("[flowcsd] spill read {} B from {} at {}",

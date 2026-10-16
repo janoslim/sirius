@@ -76,4 +76,8 @@ void install_config(flowcsd_config config);
 /// The installed config, or the defaults above when none was installed.
 [[nodiscard]] flowcsd_config const& config();
 
+/// SSD index of a Tutti-served path: the position of the first tutti_path_prefixes
+/// entry it starts with (0 for /mnt/tutti0/, 1 for /mnt/tutti1/), or -1.
+[[nodiscard]] int tutti_device_index(std::string const& path) noexcept;
+
 }  // namespace sirius::flowcsd

@@ -54,4 +54,13 @@ void install_config(flowcsd_config config) { installed_config = std::move(config
 
 flowcsd_config const& config() { return installed_config; }
 
+int tutti_device_index(std::string const& path) noexcept
+{
+  auto const& prefixes = installed_config.tutti_path_prefixes;
+  for (std::size_t index = 0; index < prefixes.size(); ++index) {
+    if (path.starts_with(prefixes[index])) { return static_cast<int>(index); }
+  }
+  return -1;
+}
+
 }  // namespace sirius::flowcsd

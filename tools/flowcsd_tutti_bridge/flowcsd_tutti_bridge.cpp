@@ -19,10 +19,14 @@
 // Maps the integer ids of flowcsd_tutti_bridge.hpp onto Tutti handles and turns
 // a list of io_requests into Tutti submits that stay inside the local-NVMe
 // DataPath's per-submit limits, with at most kMaxSubmitsInFlight in flight.
+// When asked (submit_trace), it timestamps each submit -- stream wait, host
+// submit, kernel launch, completion seen -- and marks the same phases as NVTX
+// ranges, so Sirius's event trace can split an NVMe read into waiting and work.
 
 #include "flowcsd_tutti_bridge.hpp"
 
 #include <tutti/accelerator_device_guard.h>
+#include <tutti/io_trace.h>
 #include <tutti/io_types.h>
 #include <tutti/memory_types.h>
 #include <tutti/status.h>
@@ -30,11 +34,17 @@
 #include <tutti/tutti_runtime.h>
 
 #include <cuda_runtime_api.h>
+#include <nvtx3/nvToolsExt.h>
 
+#include <algorithm>
+#include <chrono>
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <deque>
+#include <format>
+#include <fstream>
+#include <iterator>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -133,10 +143,33 @@ void keep_first(std::string& first_error, std::string message)
   if (first_error.empty()) { first_error = std::move(message); }
 }
 
+/// The "flowcsd" NVTX domain, shared with Sirius's FlowCSD trace (same name, same domain in nsys).
+nvtxDomainHandle_t nvtx_domain()
+{
+  static nvtxDomainHandle_t const domain = nvtxDomainCreateA("flowcsd");
+  return domain;
+}
+
+/// Start an NVTX range that may end on another thread or overlap others.  Without a
+/// profiler attached NVTX calls do nothing.  Only call with a non-null name.
+nvtxRangeId_t nvtx_start(char const* name)
+{
+  nvtxEventAttributes_t attributes{};
+  attributes.version       = NVTX_VERSION;
+  attributes.size          = NVTX_EVENT_ATTRIB_STRUCT_SIZE;
+  attributes.messageType   = NVTX_MESSAGE_TYPE_ASCII;
+  attributes.message.ascii = name;
+  return nvtxDomainRangeStartEx(nvtx_domain(), &attributes);
+}
+
+void nvtx_end(nvtxRangeId_t range) { nvtxDomainRangeEnd(nvtx_domain(), range); }
+
 /// An accepted Tutti submit and the stream its I/O kernel runs on.
 struct pending_submit {
   tutti::IoHandle io;
   cudaStream_t stream;
+  std::size_t timing_index{0};    ///< its entry in submit_trace::timings, when traced
+  nvtxRangeId_t device_range{0};  ///< its launch -> completion NVTX range, when traced
 };
 
 }  // namespace
@@ -164,10 +197,20 @@ struct runtime::impl {
   ~impl();
 
   void create_streams();
-  cudaStream_t acquire_stream();
+  /// A free stream; waits while every stream is busy.  @p waited tells whether it
+  /// had to, and @p nvtx_wait (if not null) names an NVTX range over that wait.
+  cudaStream_t acquire_stream(bool& waited, char const* nvtx_wait);
   /// nullptr when every stream is in use.
   cudaStream_t try_acquire_stream();
   void release_stream(cudaStream_t stream);
+
+  // Raw I/O trace (TUTTI_IO_TRACE=1): labels of submit kinds (tag = index + 1)
+  // and the last %globaltimer <-> steady_clock pairing.
+  std::mutex trace_mutex;
+  std::vector<std::string> kinds;
+  tutti::io_trace::ClockSample clock_start;
+  /// Tutti tag for a kind label (registered on first use); 0 for no label.
+  std::uint32_t kind_tag(char const* kind);
 
   std::vector<tutti::IoRequest> to_tutti(std::span<io_request const> requests);
 
@@ -221,10 +264,15 @@ void runtime::impl::create_streams()
   }
 }
 
-cudaStream_t runtime::impl::acquire_stream()
+cudaStream_t runtime::impl::acquire_stream(bool& waited, char const* nvtx_wait)
 {
   std::unique_lock lock{streams_mutex};
-  stream_returned.wait(lock, [this] { return !free_streams.empty(); });
+  waited = free_streams.empty();
+  if (waited) {
+    nvtxRangeId_t const range = nvtx_wait != nullptr ? nvtx_start(nvtx_wait) : 0;
+    stream_returned.wait(lock, [this] { return !free_streams.empty(); });
+    if (nvtx_wait != nullptr) { nvtx_end(range); }
+  }
   auto const stream = free_streams.back();
   free_streams.pop_back();
   return stream;
@@ -312,6 +360,10 @@ runtime::runtime(std::string const& config_path) : _impl(std::make_unique<impl>(
   }
   _impl->accel_id = _impl->storage->accel_id();
   _impl->create_streams();
+  // Pair the clocks before the first traced I/O; write_io_trace pairs them again.
+  if (tutti::io_trace::enabled()) {
+    _impl->clock_start = tutti::io_trace::sample_clock(_impl->accel_id);
+  }
 }
 
 runtime::~runtime() = default;
@@ -387,17 +439,35 @@ void runtime::unregister_device_memory(std::uint32_t memory_id)
   }
 }
 
-void runtime::submit_and_wait(std::span<io_request const> requests)
+void runtime::submit_and_wait(std::span<io_request const> requests, submit_trace const& trace)
 {
+  using clock          = std::chrono::steady_clock;
   auto const converted = _impl->to_tutti(requests);
   std::deque<pending_submit> pending;
   std::string first_error;
+  // Wait for one submit; when traced, stamp when the host saw its completion
+  // and close its launch -> completion NVTX range.
+  auto const complete = [&](pending_submit const& submit) {
+    _impl->finish(submit, first_error);
+    if (trace.timings != nullptr) { (*trace.timings)[submit.timing_index].completed = clock::now(); }
+    if (trace.nvtx_device != nullptr) { nvtx_end(submit.device_range); }
+  };
+  // Tutti labels the batches these submits launch with this thread's tag (its
+  // DataPath submit runs on the calling thread); cleared on every way out.
+  tutti::io_trace::set_thread_tag(_impl->kind_tag(trace.kind));
+  struct clear_tag {
+    ~clear_tag() { tutti::io_trace::set_thread_tag(0); }
+  } const tag_guard{};
   for (auto const submit : split_into_submits(converted)) {
+    submit_timing timing;
+    timing.stream_wait_begin = clock::now();
     // Never block for a stream while holding one: reuse this call's oldest
     // stream instead, so two callers that each hold streams cannot deadlock.
-    cudaStream_t stream = pending.empty() ? _impl->acquire_stream() : _impl->try_acquire_stream();
+    cudaStream_t stream = pending.empty()
+                            ? _impl->acquire_stream(timing.waited_for_stream, trace.nvtx_stream_wait)
+                            : _impl->try_acquire_stream();
     if (stream == nullptr) {
-      _impl->finish(pending.front(), first_error);
+      complete(pending.front());
       stream = pending.front().stream;
       pending.pop_front();
     }
@@ -407,11 +477,27 @@ void runtime::submit_and_wait(std::span<io_request const> requests)
       break;
     }
 
+    // Host part of the submit: Tutti stages the entries and launches the I/O kernel.
+    timing.requests = static_cast<std::uint32_t>(submit.size());
+    for (auto const& request : submit) {
+      timing.bytes += request.length;
+    }
+    timing.submit_begin = clock::now();
+    nvtxRangeId_t const submit_range =
+      trace.nvtx_submit != nullptr ? nvtx_start(trace.nvtx_submit) : 0;
     tutti::HostSubmitContext const context{
       tutti::ExecutionDomain::DEVICE_EXECUTION, _impl->accel_id, stream};
     auto const outcome = _impl->storage->submit(submit.data(), submit.size(), context);
+    if (trace.nvtx_submit != nullptr) { nvtx_end(submit_range); }
+    timing.launched = clock::now();
     if (outcome.io.has_value()) {
-      pending.push_back(pending_submit{*outcome.io, stream});
+      pending_submit accepted{*outcome.io, stream};
+      if (trace.timings != nullptr) {
+        accepted.timing_index = trace.timings->size();
+        trace.timings->push_back(timing);
+      }
+      if (trace.nvtx_device != nullptr) { accepted.device_range = nvtx_start(trace.nvtx_device); }
+      pending.push_back(accepted);
     } else {
       _impl->release_stream(stream);
     }
@@ -430,11 +516,165 @@ void runtime::submit_and_wait(std::span<io_request const> requests)
   // Drain everything in flight, also after a failure: the caller reuses its
   // memory as soon as this returns or throws.
   while (!pending.empty()) {
-    _impl->finish(pending.front(), first_error);
+    complete(pending.front());
     _impl->release_stream(pending.front().stream);
     pending.pop_front();
   }
   if (!first_error.empty()) { throw std::runtime_error(first_error); }
+}
+
+std::uint32_t runtime::impl::kind_tag(char const* kind)
+{
+  if (kind == nullptr || !tutti::io_trace::enabled()) { return 0; }
+  std::lock_guard lock{trace_mutex};
+  auto const found = std::find(kinds.begin(), kinds.end(), kind);
+  if (found != kinds.end()) { return static_cast<std::uint32_t>(found - kinds.begin()) + 1; }
+  kinds.emplace_back(kind);
+  return static_cast<std::uint32_t>(kinds.size());
+}
+
+bool runtime::io_trace_enabled() { return tutti::io_trace::enabled(); }
+
+namespace {
+
+/// Maps %globaltimer to ns since the query start: the line through two clock
+/// pairings, or an offset when only one is valid.  Deltas are taken in integers
+/// first, since globaltimer values (~1e18) lose ns precision as doubles.
+struct gpu_clock_fit {
+  std::int64_t host_ref_ns{0};  ///< steady_clock ns of the reference pairing, minus the query start
+  std::uint64_t gpu_ref_ns{0};
+  double scale{1.0};            ///< host ns per GPU ns
+  bool valid{false};
+
+  /// Query-relative ns of a GPU stamp; "" for 0 (a step not reached).
+  [[nodiscard]] std::string operator()(std::uint64_t gpu_ns) const
+  {
+    if (gpu_ns == 0 || !valid) { return {}; }
+    auto const delta = static_cast<double>(static_cast<std::int64_t>(gpu_ns - gpu_ref_ns));
+    return std::to_string(host_ref_ns + static_cast<std::int64_t>(delta * scale));
+  }
+};
+
+gpu_clock_fit fit_gpu_clock(tutti::io_trace::ClockSample const& start,
+                            tutti::io_trace::ClockSample const& end,
+                            std::int64_t query_start_ns)
+{
+  gpu_clock_fit fit;
+  auto const& reference = start.valid ? start : end;
+  if (!reference.valid) { return fit; }
+  fit.valid       = true;
+  fit.host_ref_ns = reference.host_ns - query_start_ns;
+  fit.gpu_ref_ns  = reference.gpu_ns;
+  if (start.valid && end.valid && end.gpu_ns > start.gpu_ns) {
+    fit.scale = static_cast<double>(end.host_ns - start.host_ns) /
+                static_cast<double>(end.gpu_ns - start.gpu_ns);
+  }
+  return fit;
+}
+
+/// Query-relative ns of a host steady_clock stamp.
+std::int64_t host_rel(std::uint64_t host_ns, std::int64_t query_start_ns)
+{
+  return static_cast<std::int64_t>(host_ns) - query_start_ns;
+}
+
+std::string clock_sample_json(tutti::io_trace::ClockSample const& sample, std::int64_t query_start_ns)
+{
+  return std::format(
+    "{{\"valid\": {}, \"host_ns\": {}, \"gpu_ns\": {}, \"uncertainty_ns\": {}}}",
+    sample.valid ? "true" : "false",
+    sample.valid ? sample.host_ns - query_start_ns : 0,
+    sample.gpu_ns,
+    sample.uncertainty_ns);
+}
+
+void write_text(std::string const& path, std::string const& text)
+{
+  std::ofstream file(path, std::ios::trunc);
+  file << text;
+  if (!file) { std::fprintf(stderr, "flowcsd_tutti_bridge: could not write %s\n", path.c_str()); }
+}
+
+}  // namespace
+
+void runtime::write_io_trace(std::string const& base, std::int64_t query_start_ns)
+{
+  if (!tutti::io_trace::enabled()) { return; }
+  std::vector<tutti::io_trace::CommandRecord> commands;
+  std::vector<tutti::io_trace::WorkerRecord> workers;
+  std::vector<tutti::io_trace::BatchRecord> batches;
+  tutti::io_trace::drain(commands, workers, batches);
+  auto const clock_end = tutti::io_trace::sample_clock(_impl->accel_id);
+  std::vector<std::string> kinds;
+  tutti::io_trace::ClockSample clock_start;
+  {
+    std::lock_guard lock{_impl->trace_mutex};
+    kinds       = _impl->kinds;
+    clock_start = _impl->clock_start;
+    // The next query's records are bracketed by this pairing and the next one.
+    _impl->clock_start = clock_end;
+  }
+  auto const to_query_ns = fit_gpu_clock(clock_start, clock_end, query_start_ns);
+
+  // One row per NVMe command.
+  std::string text =
+    "batch,worker,device,direction,bytes,status,smid,warpid,"
+    "t_entry_ns,t_published_ns,t_cqe_ns,t_reclaimed_ns\n";
+  text.reserve(text.size() + 110 * commands.size());
+  for (auto const& c : commands) {
+    std::format_to(std::back_inserter(text),
+                   "{},{},{},{},{},{},{},{},{},{},{},{}\n",
+                   c.batch, c.worker, c.device, c.direction, c.bytes, c.status, c.smid,
+                   c.warpid, to_query_ns(c.t_entry), to_query_ns(c.t_published),
+                   to_query_ns(c.t_cqe), to_query_ns(c.t_reclaimed));
+  }
+  write_text(base + ".tutti_commands.csv", text);
+
+  // One row per I/O-kernel thread (one-warp blocks).
+  text = "batch,worker,block,smid,warpid,commands,t_start_ns,t_end_ns\n";
+  text.reserve(text.size() + 70 * workers.size());
+  for (auto const& w : workers) {
+    std::format_to(std::back_inserter(text),
+                   "{},{},{},{},{},{},{},{}\n",
+                   w.batch, w.worker, w.block, w.smid, w.warpid, w.commands,
+                   to_query_ns(w.t_start), to_query_ns(w.t_end));
+  }
+  write_text(base + ".tutti_workers.csv", text);
+
+  // One row per I/O-kernel launch; kind is the caller's label (submit_trace::kind).
+  text =
+    "batch,kind,stream,commands,bytes,blocks,threads_per_block,workers,pool_workers,"
+    "host_submit_ns,host_launch_ns,host_launched_ns,host_complete_ns\n";
+  for (auto const& b : batches) {
+    auto const kind = b.tag > 0 && b.tag <= kinds.size() ? kinds[b.tag - 1] : std::string{};
+    std::format_to(std::back_inserter(text),
+                   "{},{},{:#x},{},{},{},{},{},{},{},{},{},{}\n",
+                   b.batch, kind, b.stream, b.commands, b.bytes, b.blocks, b.threads_per_block,
+                   b.workers, b.pool_workers, host_rel(b.host_submit_ns, query_start_ns),
+                   host_rel(b.host_launch_ns, query_start_ns),
+                   host_rel(b.host_launched_ns, query_start_ns),
+                   host_rel(b.host_complete_ns, query_start_ns));
+  }
+  write_text(base + ".tutti_batches.csv", text);
+
+  // How GPU stamps became query-relative ns, so they can be checked or redone.
+  write_text(base + ".tutti_clock.json",
+             std::format("{{\"query_start_steady_ns\": {}, \"start\": {}, \"end\": {}, "
+                         "\"fit\": {{\"valid\": {}, \"host_ref_ns\": {}, \"gpu_ref_ns\": {}, "
+                         "\"scale\": {:.12f}}}, \"globaltimer_step_ns\": {}, \"sm_count\": {}, "
+                         "\"records\": {{\"commands\": {}, \"workers\": {}, \"batches\": {}}}}}\n",
+                         query_start_ns,
+                         clock_sample_json(clock_start, query_start_ns),
+                         clock_sample_json(clock_end, query_start_ns),
+                         to_query_ns.valid ? "true" : "false",
+                         to_query_ns.host_ref_ns,
+                         to_query_ns.gpu_ref_ns,
+                         to_query_ns.scale,
+                         clock_end.globaltimer_step_ns,
+                         clock_end.sm_count,
+                         commands.size(),
+                         workers.size(),
+                         batches.size()));
 }
 
 }  // namespace flowcsd_tutti_bridge

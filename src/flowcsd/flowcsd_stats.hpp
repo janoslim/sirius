@@ -25,9 +25,17 @@
 // to "other".  The exclusive times therefore sum to the query wall time even
 // though scan, decode, spill and compute run concurrently on different threads.
 // Plain per-category busy time (sum of interval lengths) is reported as well.
+//
+// Event trace (FLOWCSD_TRACE_JSONL=<path>, off by default): at query end every
+// recorded interval -- the time categories above plus trace-only sub-intervals
+// (trace_category) -- is appended to <path> as one JSON line, with times relative
+// to the query start, and the same intervals are NVTX ranges in the "flowcsd"
+// domain while the query runs.  Sub-intervals never enter the time_ms
+// attribution, so traced and untraced runs report comparable metrics.
 
 #include <chrono>
 #include <cstdint>
+#include <functional>
 #include <string>
 
 namespace sirius::flowcsd {
@@ -40,6 +48,33 @@ enum class time_category : std::uint8_t {
   decode,          ///< cuDF decompression + decode of the read pages
   hash_partition,  ///< PARTITION operator (hash scatter of build/probe batches)
   compute,         ///< every other operator: filter, join build/probe, aggregate, sort, projection
+  count
+};
+
+/// Trace-only sub-intervals: what a thread did inside a time category (waiting
+/// for a staging slab, building a Tutti submit, waiting for the SSD, copying).
+/// trace_category_name() gives the trace / NVTX name in brackets.
+enum class trace_category : std::uint8_t {
+  meta_pread,              ///< [meta.pread] O_DIRECT host read of a footer or page index
+  io_slab_wait,            ///< [io.slab_wait] scan read waits for a free scan staging slab
+  io_stream_wait,          ///< [io.stream_wait] waits for a free Tutti submit stream (16 in flight)
+  io_submit,               ///< [io.submit] host builds one Tutti submit and launches its I/O kernel
+  io_device,               ///< [io.device] kernel launched -> host saw its completion (SSD + PCIe)
+  io_copy,                 ///< [io.copy] slab -> destination D2D copies + stream sync
+  spill_w_prepare,         ///< [spill_w.prepare] wait for the batch's producers, plan layout, take region
+  spill_w_slab_wait,       ///< [spill_w.slab_wait] spill write waits for a free spill staging slab
+  spill_w_copy_to_slab,    ///< [spill_w.copy_to_slab] batch buffers -> slab D2D copies + stream sync
+  spill_w_stream_wait,     ///< [spill_w.stream_wait] waits for a free Tutti submit stream
+  spill_w_submit,          ///< [spill_w.submit] host builds one Tutti WRITE submit and launches it
+  spill_w_device,          ///< [spill_w.device] kernel launched -> host saw its completion
+  spill_r_prepare,         ///< [spill_r.prepare] allocate the restore buffers
+  spill_r_slab_wait,       ///< [spill_r.slab_wait] spill read waits for a free spill staging slab
+  spill_r_stream_wait,     ///< [spill_r.stream_wait] waits for a free Tutti submit stream
+  spill_r_submit,          ///< [spill_r.submit] host builds one Tutti READ submit and launches it
+  spill_r_device,          ///< [spill_r.device] kernel launched -> host saw its completion
+  spill_r_copy_from_slab,  ///< [spill_r.copy_from_slab] slab -> restore buffers D2D copies + sync
+  spill_r_unpack,          ///< [spill_r.unpack] rebuild cudf columns from the buffers + stream sync
+  sched_mem_wait,          ///< [sched.mem_wait] a ready pipeline task waits for its GPU reservation
   count
 };
 
@@ -92,7 +127,8 @@ struct column_scan_counters {
 /// ("table.column"); no-op outside a query.
 void add_column_scan(std::string const& key, column_scan_counters const& counters);
 
-/// Records the interval [construction, destruction) under one category.
+/// Records the interval [construction, destruction) under one category (and,
+/// when tracing, an NVTX range of the category name).
 class timed_scope {
  public:
   explicit timed_scope(time_category category) noexcept;
@@ -103,15 +139,71 @@ class timed_scope {
 
  private:
   time_category _category;
+  bool _tracing;
   std::chrono::steady_clock::time_point _start;
 };
+
+/// True when $FLOWCSD_TRACE_JSONL names an event-trace file (read once per process).
+[[nodiscard]] bool trace_enabled() noexcept;
+
+/// Trace and NVTX name of a sub-interval, e.g. "io.device".
+[[nodiscard]] char const* trace_category_name(trace_category category) noexcept;
+
+/// The I/O fields of a trace line.
+struct trace_io {
+  std::uint64_t bytes{0};  ///< bytes moved (reservation bytes for sched.mem_wait)
+  std::int32_t dev{-1};    ///< SSD: position of the file's prefix in tutti_path_prefixes; -1 none
+  std::uint32_t n_req{0};  ///< Tutti requests (io_requests) behind the interval
+};
+
+/// Record a sub-interval [begin, end) that already happened on this thread (for
+/// phases timed elsewhere, e.g. inside the Tutti bridge).  No-op unless a query
+/// is being traced; no NVTX range (the timer of the phase emits it).
+void record_trace(trace_category category,
+                  std::chrono::steady_clock::time_point begin,
+                  std::chrono::steady_clock::time_point end,
+                  trace_io const& io) noexcept;
+
+/// Records [construction, destruction) as a sub-interval and an NVTX range of the
+/// same name.  No-op unless tracing.
+class trace_scope {
+ public:
+  explicit trace_scope(trace_category category) noexcept;
+  ~trace_scope();
+
+  trace_scope(trace_scope const&)            = delete;
+  trace_scope& operator=(trace_scope const&) = delete;
+
+  /// Attach I/O fields to the line written when the scope ends.
+  void set_io(trace_io const& io) noexcept
+  {
+    _io     = io;
+    _has_io = true;
+  }
+
+ private:
+  trace_category _category;
+  bool _tracing;
+  bool _has_io{false};
+  trace_io _io;
+  std::chrono::steady_clock::time_point _start;
+};
+
+/// Extra per-query trace output written when a traced query ends, next to the
+/// JSONL: @p base is the trace path without ".trace.jsonl" (the Tutti service
+/// writes <base>.tutti_*.csv), @p query_start the trace's t = 0.
+using trace_writer =
+  std::function<void(std::string const& base, std::chrono::steady_clock::time_point query_start)>;
+
+/// Register a writer (kept for the life of the process).
+void add_trace_writer(trace_writer writer);
 
 /// Start collecting for one GPU query: clears counters and intervals.
 void begin_query(std::uint64_t query_id);
 
 /// Close the query, sweep the intervals and append one JSON line to the stats
 /// file (flowcsd_config::stats_jsonl or $FLOWCSD_STATS_JSONL).  A failed query
-/// is recorded with "ok": false.
+/// is recorded with "ok": false.  When tracing, also append the event trace.
 void end_query(std::uint64_t query_id, bool succeeded);
 
 }  // namespace sirius::flowcsd

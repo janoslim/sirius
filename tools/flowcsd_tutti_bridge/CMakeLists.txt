@@ -40,7 +40,8 @@ add_subdirectory("${TUTTI_ROOT}" tutti EXCLUDE_FROM_ALL)
 find_package(CUDAToolkit REQUIRED)
 
 add_library(flowcsd_tutti_bridge SHARED flowcsd_tutti_bridge.cpp)
-target_link_libraries(flowcsd_tutti_bridge PRIVATE tutti_runtime CUDA::cudart)
+# CUDA::nvtx3 is header-only (NVTX ranges for the FlowCSD trace; no-ops without a profiler).
+target_link_libraries(flowcsd_tutti_bridge PRIVATE tutti_runtime CUDA::cudart CUDA::nvtx3)
 # Tutti's public cuda_like.h includes <cuda/atomic>; CUDA 13 keeps CCCL under
 # <toolkit include>/cccl, which Tutti adds only inside its own tree (as the
 # tutti_probe build does, the bridge adds it itself).

@@ -21,6 +21,7 @@
 #include "cuda_runtime_api.h"
 #include "downgrade/downgrade_executor.hpp"
 #include "exec/leased_callable.hpp"
+#include "flowcsd/flowcsd_stats.hpp"
 #include "log/logging.hpp"
 #include "op/scan/table_scan/scan_contract.hpp"
 #include "op/sirius_physical_operator.hpp"
@@ -43,6 +44,7 @@
 #include <format>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <utility>
 namespace sirius {
@@ -228,6 +230,13 @@ void gpu_pipeline_executor::process_task(
     // would have exploited is over.  A reservation that succeeds outright is the
     // common case and raises nothing.
     auto reservation = _memory_space->make_reservation_or_null(bytes_needs);
+    // FlowCSD trace: a ready task that does not get its full reservation at once waits
+    // (blocking reservation and/or a downgrade) until it does; that wait is sched.mem_wait.
+    std::optional<flowcsd::trace_scope> mem_wait;
+    if (!reservation || reservation->size() < bytes_needs) {
+      mem_wait.emplace(flowcsd::trace_category::sched_mem_wait);
+      mem_wait->set_io({bytes_needs, -1, 0});
+    }
     if (!reservation) {
       if (_query_event_publisher) {
         auto const* pipe               = gpu_task->get_pipeline();
@@ -375,6 +384,7 @@ void gpu_pipeline_executor::process_task(
         gpu_task->get_task_id(),
         reservation->size());
     }
+    mem_wait.reset();
     if (auto* local_state = dynamic_cast<sirius::pipeline::sirius_pipeline_task_local_state*>(
           gpu_task->local_state())) {
       local_state->set_reservation(std::move(reservation), reservation_info);

@@ -97,7 +97,9 @@ size_t direct_host_read(tutti_io_object const& file, size_t offset, size_t size,
   // Stop as soon as the wanted bytes are in: at the end of the file pread
   // returns short, and a second pread from that unaligned position would fail
   // under O_DIRECT.
-  size_t filled = 0;
+  flowcsd::trace_scope read_trace{flowcsd::trace_category::meta_pread};
+  std::uint32_t preads = 0;
+  size_t filled        = 0;
   while (aligned_begin + filled < wanted_end) {
     auto const result = ::pread(file.direct_fd(),
                                 bounce.get() + filled,
@@ -113,10 +115,14 @@ size_t direct_host_read(tutti_io_object const& file, size_t offset, size_t size,
                                " ended before its recorded size");
     }
     filled += static_cast<size_t>(result);
+    ++preads;
   }
   // metadata_read counts what the kernel read (whole blocks), so it can be checked
   // against the block-layer counters of the Tutti SSDs.
   flowcsd::add_bytes(flowcsd::byte_counter::metadata_read, filled);
+  if (flowcsd::trace_enabled()) {
+    read_trace.set_io({filled, flowcsd::tutti_device_index(file.object_path()), preads});
+  }
   std::memcpy(dst, bounce.get() + (offset - aligned_begin), size);
   return size;
 }
