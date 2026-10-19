@@ -192,11 +192,11 @@ class kvikio_context final : public ioctx {
   [[nodiscard]] bool supports_device_read() const noexcept override { return true; }
   [[nodiscard]] bool supports_vector_host_read() const noexcept override { return false; }
   [[nodiscard]] bool supports_host_to_device_read() const noexcept override { return false; }
-  [[nodiscard]] bool supports_device_range_read() const noexcept override { return false; }
+  [[nodiscard]] bool supports_device_range_read() const noexcept override { return true; }
 
-  /// Always false: kvikIO is a local-file path, and its whole point is streaming
-  /// straight to device per read rather than assembling a batch first.
-  [[nodiscard]] bool prefers_bulk_io() const noexcept override { return false; }
+  /// True so local Parquet scans take the hybrid_scan_reader bulk route and
+  /// dispatch column chunk ranges in parallel across KvikIO's GDS thread pool.
+  [[nodiscard]] bool prefers_bulk_io() const noexcept override { return true; }
 
   /// Always zero: no prefetching cache on this backend, so nothing to read
   /// ahead into.

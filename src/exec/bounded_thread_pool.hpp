@@ -108,16 +108,18 @@ class bounded_thread_pool {
     auto* latch_ptr   = init_latch.get();
 
     for (int i = 0; i < capacity; ++i) {
-      auto& t = threads_.emplace_back([this, init_fn_ptr, latch_ptr]() {
+      auto& t = threads_.emplace_back([this, name, init_fn_ptr, latch_ptr]() {
+        char const* role_name =
+          (name == "downgrade") ? "sirius_spill"
+          : (name.starts_with("scan_")) ? "scan_mgr"
+          : "sirius_pipe";
+        pthread_setname_np(pthread_self(), role_name);
         if (init_fn_ptr) {
           (*init_fn_ptr)();
           latch_ptr->count_down();
         }
         work_loop();
       });
-      if (!name.empty()) {
-        std::ignore = sirius::exec::thread_util::set_thread_name(t, name + "_" + std::to_string(i));
-      }
       if (!cpu_ids.empty()) {
         std::ignore = sirius::exec::thread_util::set_thread_affinity(t, cpu_ids);
       }

@@ -42,6 +42,9 @@
 #include <cudf/unary.hpp>
 #include <cudf/utilities/traits.hpp>
 
+#include <kvikio/defaults.hpp>
+#include <kvikio/file_handle.hpp>
+
 #include <rmm/aligned.hpp>
 #include <rmm/cuda_device.hpp>
 #include <rmm/device_buffer.hpp>
@@ -60,6 +63,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <format>
+#include <future>
 #include <iterator>
 #include <map>
 #include <memory>
@@ -138,21 +142,31 @@ class tutti_spill_store {
   {
     return _files[file_index].path;
   }
+  [[nodiscard]] kvikio::FileHandle& kvikio_handle(std::size_t file_index)
+  {
+    return *_files[file_index].kvikio_handle;
+  }
 
  private:
   struct spill_file {
     std::string path;
     std::uint32_t file_id{0};
+    std::optional<kvikio::FileHandle> kvikio_handle;
     std::size_t dir_index{0};                            ///< position of its dir in spill_dirs
     std::map<std::uint64_t, std::uint64_t> free_ranges;  ///< offset -> length, both aligned
   };
 
   tutti_spill_store();
 
+  /// Open (or re-open when spill_dirs changes between queries) all *.spill files in spill_dirs.
+  void open_spill_dirs(std::vector<std::string> const& spill_dirs);
+
   /// First fit over the files of one spill dir, in file order.  Caller holds _mutex.
   std::optional<tutti_spill_region> allocate_in_dir(std::size_t dir_index, std::uint64_t bytes);
 
-  std::vector<spill_file> _files;  ///< fixed after construction; free_ranges guarded by _mutex
+  std::vector<spill_file> _files;  ///< guarded by _mutex
+  std::vector<std::string> _configured_dirs;
+  bool _use_tutti{false};
   std::size_t _dir_count{0};
   std::uint64_t _capacity_bytes{0};
 
@@ -169,41 +183,58 @@ tutti_spill_store& tutti_spill_store::instance()
   return *store;
 }
 
-tutti_spill_store::tutti_spill_store()
+tutti_spill_store::tutti_spill_store() { open_spill_dirs(flowcsd::config().spill_dirs); }
+
+void tutti_spill_store::open_spill_dirs(std::vector<std::string> const& spill_dirs)
 {
-  auto& service = io::tutti::tutti_service::instance();
-  if (SPILL_ALIGNMENT_BYTES % service.block_bytes() != 0) {
-    throw std::runtime_error(
-      std::format("tutti spill: Tutti block size {} B does not divide the {} B spill alignment",
-                  service.block_bytes(),
-                  SPILL_ALIGNMENT_BYTES));
+  if (spill_dirs.empty()) {
+    throw std::runtime_error("direct_disk_spill needs sirius.flowcsd.spill_dirs");
+  }
+  bool const use_tutti = io::tutti::tutti_service::configured();
+  if (use_tutti) {
+    auto& service = io::tutti::tutti_service::instance();
+    if (SPILL_ALIGNMENT_BYTES % service.block_bytes() != 0) {
+      throw std::runtime_error(
+        std::format("tutti spill: Tutti block size {} B does not divide the {} B spill alignment",
+                    service.block_bytes(),
+                    SPILL_ALIGNMENT_BYTES));
+    }
   }
 
-  // Open every spill file once; the whole file (rounded down to the alignment) starts free.
-  auto const& spill_dirs = flowcsd::config().spill_dirs;
-  if (spill_dirs.empty()) {
-    throw std::runtime_error("tutti spill: direct_disk_spill needs sirius.flowcsd.spill_dirs");
-  }
+  _files.clear();
+  _capacity_bytes = 0;
+  _next_dir_index = 0;
   for (std::size_t dir_index = 0; dir_index < spill_dirs.size(); ++dir_index) {
     auto const paths = list_spill_files(spill_dirs[dir_index]);
     // An empty dir would silently put all spill traffic on the other drives.
     if (paths.empty()) {
       throw std::runtime_error(
-        std::format("tutti spill: no *{} files in {} (create them with 05_prealloc_spill.sh)",
+        std::format("spill store: no *{} files in {} (create them with 05_prealloc_spill.sh)",
                     SPILL_FILE_EXTENSION,
                     spill_dirs[dir_index]));
     }
     for (auto const& path : paths) {
-      spill_file file{.path = path, .file_id = service.open_file(path), .dir_index = dir_index};
-      auto const usable_bytes =
-        rmm::align_down(service.file_size(file.file_id), SPILL_ALIGNMENT_BYTES);
+      spill_file file{.path = path, .dir_index = dir_index};
+      std::uint64_t raw_size = 0;
+      if (use_tutti) {
+        auto& service = io::tutti::tutti_service::instance();
+        file.file_id  = service.open_file(path);
+        raw_size      = service.file_size(file.file_id);
+      } else {
+        file.kvikio_handle.emplace(path, "r+", kvikio::FileHandle::m644, kvikio::CompatMode::OFF);
+        raw_size = file.kvikio_handle->nbytes();
+      }
+      auto const usable_bytes = rmm::align_down(raw_size, SPILL_ALIGNMENT_BYTES);
       if (usable_bytes > 0) { file.free_ranges.emplace(0, usable_bytes); }
       _capacity_bytes += usable_bytes;
       _files.push_back(std::move(file));
     }
   }
-  _dir_count = spill_dirs.size();
-  SIRIUS_LOG_INFO("[flowcsd] tutti spill store: {} files, {} bytes in {} spill dirs",
+  _configured_dirs = spill_dirs;
+  _use_tutti       = use_tutti;
+  _dir_count       = spill_dirs.size();
+  SIRIUS_LOG_INFO("[flowcsd] {} spill store: {} files, {} bytes in {} spill dirs",
+                  use_tutti ? "tutti" : "kvikio-gds",
                   _files.size(),
                   _capacity_bytes,
                   _dir_count);
@@ -215,6 +246,10 @@ tutti_spill_region tutti_spill_store::allocate(std::uint64_t bytes)
   if (bytes == 0) { return tutti_spill_region{}; }
 
   std::lock_guard lock(_mutex);
+  if (_used_bytes == 0 && (_configured_dirs != flowcsd::config().spill_dirs ||
+                           _use_tutti != io::tutti::tutti_service::configured())) {
+    open_spill_dirs(flowcsd::config().spill_dirs);
+  }
   auto const first_dir_index = _next_dir_index;
   _next_dir_index            = (_next_dir_index + 1) % _dir_count;
   for (std::size_t step = 0; step < _dir_count; ++step) {
@@ -407,6 +442,67 @@ void collect_column_writes(cudf::column_view const& column,
   }
 }
 
+/// Dispatch spill writes or reads through Tutti when configured, or KvikIO GDS FileHandle (r+,
+/// CompatMode::OFF) otherwise.
+io::tutti::transfer_stats submit_spill_io(tutti_spill_store& store,
+                                          tutti_spill_region const& region,
+                                          std::vector<io::tutti::device_write> const* writes,
+                                          std::vector<io::tutti::device_read> const* reads,
+                                          ::cuda::stream_ref stream)
+{
+  if (io::tutti::tutti_service::configured()) {
+    if (writes != nullptr) {
+      return io::tutti::tutti_service::instance().write(
+        region.file_id, *writes, io::tutti::staging_pool::spill, stream.get());
+    }
+    return io::tutti::tutti_service::instance().read(
+      region.file_id, *reads, io::tutti::staging_pool::spill, stream.get());
+  }
+
+  auto& handle = store.kvikio_handle(region.file_index);
+  std::vector<std::pair<std::size_t, std::future<std::size_t>>> futures;
+  if (writes != nullptr) {
+    futures.reserve(writes->size());
+    for (auto const& w : *writes) {
+      futures.emplace_back(w.bytes,
+                           handle.pwrite(w.src,
+                                         w.bytes,
+                                         w.file_offset,
+                                         kvikio::defaults::task_size(),
+                                         kvikio::defaults::gds_threshold(),
+                                         /*sync_default_stream=*/false));
+    }
+  } else {
+    // Drain stream-ordered buffer allocations on `stream` before KvikIO worker threads issue
+    // synchronous cuFileRead into those buffers.
+    stream.sync();
+    futures.reserve(reads->size());
+    for (auto const& r : *reads) {
+      futures.emplace_back(r.bytes,
+                           handle.pread(r.dst,
+                                        r.bytes,
+                                        r.file_offset,
+                                        kvikio::defaults::task_size(),
+                                        kvikio::defaults::gds_threshold(),
+                                        /*sync_default_stream=*/false));
+    }
+  }
+
+  std::uint64_t total_bytes = 0;
+  for (auto& [expected_bytes, future] : futures) {
+    auto const completed = future.get();
+    if (completed != expected_bytes) {
+      throw std::runtime_error("kvikio spill: short read/write on " +
+                               store.file_path(region.file_index));
+    }
+    total_bytes += completed;
+  }
+  return io::tutti::transfer_stats{
+    .issued_bytes = total_bytes,
+    .requests     = static_cast<std::uint32_t>(futures.size()),
+  };
+}
+
 /**
  * @brief GPU -> DISK: write the batch buffers into a spill-store region with one Tutti call.
  *
@@ -461,9 +557,8 @@ std::unique_ptr<cucascade::idata_representation> convert_gpu_to_tutti_spill(
   prepare_trace.reset();
   std::uint64_t issued_bytes = 0;
   if (!writes.empty()) {
-    auto const transfer = io::tutti::tutti_service::instance().write(
-      region.file_id, writes, io::tutti::staging_pool::spill, stream.get());
-    issued_bytes = transfer.issued_bytes;
+    auto const transfer = submit_spill_io(store, region, &writes, nullptr, stream);
+    issued_bytes        = transfer.issued_bytes;
     flowcsd::add_bytes(flowcsd::byte_counter::spill_write, transfer.issued_bytes);
     flowcsd::add_count(flowcsd::event_counter::io_requests, transfer.requests);
   }
@@ -650,8 +745,8 @@ std::unique_ptr<cucascade::idata_representation> convert_tutti_spill_to_gpu(
     }
   }
   if (!reads.empty()) {
-    auto const transfer = io::tutti::tutti_service::instance().read(
-      region.file_id, reads, io::tutti::staging_pool::spill, stream.get());
+    auto const transfer =
+      submit_spill_io(tutti_spill_store::instance(), region, nullptr, &reads, stream);
     flowcsd::add_bytes(flowcsd::byte_counter::spill_read, transfer.issued_bytes);
     flowcsd::add_count(flowcsd::event_counter::io_requests, transfer.requests);
   }
@@ -687,15 +782,7 @@ void register_tutti_spill_converters(cucascade::representation_converter_registr
 {
   auto const& config = flowcsd::config();
   if (!config.direct_disk_spill) { return; }
-  // The downgrade executor still skips HOST, but DISK writes would go through cuCascade's file
-  // backend instead of Tutti, which changes what a spill measures.
-  if (!io::tutti::tutti_service::configured()) {
-    SIRIUS_LOG_WARN(
-      "[flowcsd] direct_disk_spill is set but no Tutti runtime is configured; GPU batches spill "
-      "to DISK through cuCascade's file backend");
-    return;
-  }
-
+  bool const use_tutti = io::tutti::tutti_service::configured();
   // register_converter throws on duplicate keys, so drop the builtin GPU -> DISK converter first.
   registry.unregister_converter<cucascade::gpu_table_representation,
                                 cucascade::disk_data_representation>();
@@ -709,7 +796,8 @@ void register_tutti_spill_converters(cucascade::representation_converter_registr
     if (!spill_dirs.empty()) { spill_dirs += ", "; }
     spill_dirs += dir;
   }
-  SIRIUS_LOG_INFO("[flowcsd] registered direct GPU <-> DISK spill through Tutti (spill dirs: {})",
+  SIRIUS_LOG_INFO("[flowcsd] registered direct GPU <-> DISK spill through {} (spill dirs: {})",
+                  use_tutti ? "Tutti" : "KvikIO GDS",
                   spill_dirs);
 }
 

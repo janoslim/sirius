@@ -90,10 +90,10 @@ void downgrade_executor::start()
 
   _request_queue.reactivate();
 
-  sirius::exec::invocable<void() noexcept> per_thread_init = nullptr;
-  if (_memory_space && _space_id.tier == cucascade::memory::Tier::GPU) {
-    auto device_id  = _memory_space->get_device_id();
-    per_thread_init = [device_id]() noexcept {
+  sirius::exec::invocable<void() noexcept> per_thread_init = [this]() noexcept {
+    pthread_setname_np(pthread_self(), "sirius_spill");
+    if (_memory_space && _space_id.tier == cucascade::memory::Tier::GPU) {
+      auto device_id = _memory_space->get_device_id();
       // Pin each worker to its GPU; silent failure leaks downgrade memcpys
       // across contexts. Lambda is noexcept, so check inline.
       cudaError_t err = cudaSetDevice(device_id);
@@ -102,8 +102,8 @@ void downgrade_executor::start()
                          device_id,
                          cudaGetErrorString(err));
       }
-    };
-  }
+    }
+  };
 
   _pool = std::make_unique<exec::bounded_thread_pool>(_config.thread_pool.num_threads,
                                                       _config.thread_pool.thread_name_prefix,
@@ -153,6 +153,7 @@ void downgrade_executor::drain()
 
 void downgrade_executor::processing_loop()
 {
+  pthread_setname_np(pthread_self(), "sirius_spill");
   while (_running.load()) {
     auto request = _request_queue.pop();
     if (!request) break;  // interrupted
@@ -587,6 +588,7 @@ bool downgrade_executor::has_viable_downgrade_target() const
 void downgrade_executor::monitor_loop()
 {
   using namespace std::chrono_literals;
+  pthread_setname_np(pthread_self(), "sirius_spill");
 
   // Monitor-thread-local; throttles the back-off warning to once per stall episode.
   bool backed_off = false;

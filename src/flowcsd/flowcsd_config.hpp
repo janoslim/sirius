@@ -39,7 +39,8 @@ struct flowcsd_config {
 
   /// Local path prefixes served by Tutti when `scan_manager.backend: tutti`.
   /// Other local paths keep the io_uring backend.
-  std::vector<std::string> tutti_path_prefixes{"/mnt/tutti0/", "/mnt/tutti1/"};
+  std::vector<std::string> tutti_path_prefixes{
+    "/mnt/smartssd0/", "/mnt/smartssd1/", "/mnt/tutti0/", "/mnt/tutti1/"};
 
   /// Size of one registered (P2P-visible) GPU staging slab.
   std::size_t staging_slab_bytes{8ull << 20};

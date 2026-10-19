@@ -16,6 +16,8 @@
 
 #include "io/kvikio/kvikio_context.hpp"
 
+#include "flowcsd/flowcsd_stats.hpp"
+
 #include <kvikio/defaults.hpp>
 #include <kvikio/remote_handle.hpp>
 
@@ -27,6 +29,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <exception>
+#include <future>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -187,17 +190,32 @@ size_t kvikio_context::host_read_io(const io_object& obj, size_t offset, size_t 
 {
   // read_at dispatches on the destination pointer type, so the same call serves
   // host and device buffers; here it is always host memory.
-  return as_kvikio(obj).read_at(dst, size, offset);
+  flowcsd::timed_scope const io_scope{flowcsd::time_category::nvme_read};
+  auto const completed = as_kvikio(obj).read_at(dst, size, offset);
+  flowcsd::add_bytes(flowcsd::byte_counter::metadata_read, completed);
+  flowcsd::add_bytes(flowcsd::byte_counter::nvme_read_issued, completed);
+  flowcsd::add_count(flowcsd::event_counter::io_requests, 1);
+  return completed;
 }
 
 exec::semi_future<size_t> kvikio_context::mixed_readv_async_io(
   const io_object& obj, std::vector<prepared_io_slice>&& slices) noexcept
 {
-  // make_semi_future_with invokes eagerly. KvikIO remains the simple fallback
-  // backend while sharing the exact prepared-slice contract with reactors.
+  // make_semi_future_with invokes eagerly. Local device slices are dispatched
+  // in parallel across KvikIO's thread pool via FileHandle::pread.
   return exec::make_semi_future_with([&obj, slices = std::move(slices)]() mutable -> size_t {
+    flowcsd::timed_scope const io_scope{flowcsd::time_category::nvme_read};
     auto const& object = as_kvikio(obj);
+    auto const* local  = dynamic_cast<kvikio_io_object const*>(&object);
     std::size_t total  = 0;
+
+    struct pending_device_pread {
+      std::size_t index;
+      std::size_t expected_bytes;
+      std::future<std::size_t> future;
+    };
+    std::vector<pending_device_pread> pending_preads;
+    std::vector<cudaStream_t> synced_streams;
 
     for (std::size_t index = 0; index < slices.size(); ++index) {
       auto& slice = slices[index];
@@ -205,71 +223,110 @@ exec::semi_future<size_t> kvikio_context::mixed_readv_async_io(
         auto const bytes = clamp_to_object(obj, slice.offset(), slice.size());
         slice.rng.size   = bytes;
 
-        if (bytes != 0) {
-          if (slice.is_fragmented()) {
-            throw std::runtime_error("kvikio_context does not accept fragmented cache buffers");
+        if (bytes == 0) {
+          if (slice.on_complete != nullptr) {
+            (*slice.on_complete)(slice.h_buffer.fragments(), true);
+          }
+          continue;
+        }
+
+        if (slice.is_fragmented()) {
+          throw std::runtime_error("kvikio_context does not accept fragmented cache buffers");
+        }
+
+        if (!slice.is_contiguous() && slice.has_device_request() && local != nullptr) {
+          int device_id = slice.d_buffer.device_id;
+          if (device_id < 0) {
+            auto const status = cudaGetDevice(&device_id);
+            if (status != cudaSuccess) { throw std::runtime_error(cudaGetErrorString(status)); }
+          }
+          rmm::cuda_set_device_raii const guard{rmm::cuda_device_id{device_id}};
+
+          // Drain caller's stream once before KvikIO worker threads issue synchronous cuFileRead
+          // into stream-ordered pool buffers allocated on that stream.
+          cudaStream_t const stream = slice.d_buffer.stream.get();
+          if (std::find(synced_streams.begin(), synced_streams.end(), stream) ==
+              synced_streams.end()) {
+            auto const sync_status = cudaStreamSynchronize(stream);
+            if (sync_status != cudaSuccess) {
+              throw std::runtime_error(cudaGetErrorString(sync_status));
+            }
+            synced_streams.push_back(stream);
           }
 
-          std::size_t completed = 0;
-          if (slice.is_contiguous()) {
-            auto* host = std::get<std::uint8_t*>(slice.h_buffer.buffer);
-            completed  = object.read_at(host, bytes, slice.offset());
+          pending_preads.push_back(pending_device_pread{
+            .index          = index,
+            .expected_bytes = bytes,
+            .future         = local->handle().pread(slice.d_buffer.data,
+                                            bytes,
+                                            slice.offset(),
+                                            kvikio::defaults::task_size(),
+                                            kvikio::defaults::gds_threshold(),
+                                            /*sync_default_stream=*/false),
+          });
+          continue;
+        }
 
-            if (completed == bytes && slice.has_device_request()) {
-              int device_id = slice.d_buffer.device_id;
-              if (device_id < 0) {
-                auto const status = cudaGetDevice(&device_id);
-                if (status != cudaSuccess) { throw std::runtime_error(cudaGetErrorString(status)); }
-              }
-              rmm::cuda_set_device_raii const guard{rmm::cuda_device_id{device_id}};
-              auto const copy_status = cudaMemcpyAsync(
-                slice.d_buffer.data, host, bytes, cudaMemcpyDefault, slice.d_buffer.stream.get());
-              if (copy_status != cudaSuccess) {
-                throw std::runtime_error(cudaGetErrorString(copy_status));
-              }
-              auto const sync_status = cudaStreamSynchronize(slice.d_buffer.stream.get());
-              if (sync_status != cudaSuccess) {
-                throw std::runtime_error(cudaGetErrorString(sync_status));
-              }
-            }
-          } else if (slice.has_device_request()) {
+        std::size_t completed = 0;
+        if (slice.is_contiguous()) {
+          auto* host = std::get<std::uint8_t*>(slice.h_buffer.buffer);
+          completed  = object.read_at(host, bytes, slice.offset());
+          flowcsd::add_bytes(flowcsd::byte_counter::metadata_read, completed);
+          flowcsd::add_bytes(flowcsd::byte_counter::nvme_read_issued, completed);
+          flowcsd::add_count(flowcsd::event_counter::io_requests, 1);
+
+          if (completed == bytes && slice.has_device_request()) {
             int device_id = slice.d_buffer.device_id;
             if (device_id < 0) {
               auto const status = cudaGetDevice(&device_id);
               if (status != cudaSuccess) { throw std::runtime_error(cudaGetErrorString(status)); }
             }
             rmm::cuda_set_device_raii const guard{rmm::cuda_device_id{device_id}};
-
-            auto const* local = dynamic_cast<kvikio_io_object const*>(&object);
-            if (local == nullptr) {
-              // kvikIO copies the HTTP body H2D on its own per-thread stream and only
-              // synchronizes that stream, so the destination — possibly a stream-ordered
-              // pool block still in use on the caller's stream — must be drained first.
-              auto const sync_status = cudaStreamSynchronize(slice.d_buffer.stream.get());
-              if (sync_status != cudaSuccess) {
-                throw std::runtime_error(cudaGetErrorString(sync_status));
-              }
-              completed = object.read_at(slice.d_buffer.data, bytes, slice.offset());
-            } else {
-              auto future = local->handle().read_async(slice.d_buffer.data,
-                                                       bytes,
-                                                       static_cast<off_t>(slice.offset()),
-                                                       0,
-                                                       slice.d_buffer.stream.get());
-              completed   = future.check_bytes_done();
+            auto const copy_status = cudaMemcpyAsync(
+              slice.d_buffer.data, host, bytes, cudaMemcpyDefault, slice.d_buffer.stream.get());
+            if (copy_status != cudaSuccess) {
+              throw std::runtime_error(cudaGetErrorString(copy_status));
             }
-          } else {
-            throw std::invalid_argument("prepared slice has no destination");
+            auto const sync_status = cudaStreamSynchronize(slice.d_buffer.stream.get());
+            if (sync_status != cudaSuccess) {
+              throw std::runtime_error(cudaGetErrorString(sync_status));
+            }
           }
-
-          if (completed != bytes) { throw std::runtime_error("kvikio_context: short read"); }
-          total += completed;
+        } else if (slice.has_device_request()) {
+          int device_id = slice.d_buffer.device_id;
+          if (device_id < 0) {
+            auto const status = cudaGetDevice(&device_id);
+            if (status != cudaSuccess) { throw std::runtime_error(cudaGetErrorString(status)); }
+          }
+          rmm::cuda_set_device_raii const guard{rmm::cuda_device_id{device_id}};
+          auto const sync_status = cudaStreamSynchronize(slice.d_buffer.stream.get());
+          if (sync_status != cudaSuccess) {
+            throw std::runtime_error(cudaGetErrorString(sync_status));
+          }
+          completed = object.read_at(slice.d_buffer.data, bytes, slice.offset());
+          flowcsd::add_bytes(flowcsd::byte_counter::nvme_read_issued, completed);
+          flowcsd::add_count(flowcsd::event_counter::io_requests, 1);
+        } else {
+          throw std::invalid_argument("prepared slice has no destination");
         }
+
+        if (completed != bytes) { throw std::runtime_error("kvikio_context: short read"); }
+        total += completed;
 
         if (slice.on_complete != nullptr) {
           (*slice.on_complete)(slice.h_buffer.fragments(), true);
         }
       } catch (...) {
+        for (auto& pending : pending_preads) {
+          try {
+            std::ignore = pending.future.get();
+          } catch (...) {
+          }
+          auto& p_slice = slices[pending.index];
+          if (p_slice.on_complete != nullptr) {
+            (*p_slice.on_complete)(p_slice.h_buffer.fragments(), false);
+          }
+        }
         if (slice.on_complete != nullptr) {
           (*slice.on_complete)(slice.h_buffer.fragments(), false);
         }
@@ -277,6 +334,39 @@ exec::semi_future<size_t> kvikio_context::mixed_readv_async_io(
           auto& skipped = slices[index];
           if (skipped.on_complete != nullptr) {
             (*skipped.on_complete)(skipped.h_buffer.fragments(), false);
+          }
+        }
+        throw;
+      }
+    }
+
+    // Collect parallel device pread completions in order.
+    for (std::size_t p_idx = 0; p_idx < pending_preads.size(); ++p_idx) {
+      auto& pending = pending_preads[p_idx];
+      auto& slice   = slices[pending.index];
+      try {
+        auto const completed = pending.future.get();
+        if (completed != pending.expected_bytes) {
+          throw std::runtime_error("kvikio_context: short read");
+        }
+        flowcsd::add_bytes(flowcsd::byte_counter::nvme_read_issued, completed);
+        flowcsd::add_count(flowcsd::event_counter::io_requests, 1);
+        total += completed;
+        if (slice.on_complete != nullptr) {
+          (*slice.on_complete)(slice.h_buffer.fragments(), true);
+        }
+      } catch (...) {
+        if (slice.on_complete != nullptr) {
+          (*slice.on_complete)(slice.h_buffer.fragments(), false);
+        }
+        for (std::size_t rem = p_idx + 1; rem < pending_preads.size(); ++rem) {
+          try {
+            std::ignore = pending_preads[rem].future.get();
+          } catch (...) {
+          }
+          auto& rem_slice = slices[pending_preads[rem].index];
+          if (rem_slice.on_complete != nullptr) {
+            (*rem_slice.on_complete)(rem_slice.h_buffer.fragments(), false);
           }
         }
         throw;
