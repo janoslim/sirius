@@ -29,6 +29,7 @@
 #include "flowcsd/flowcsd_stats.hpp"
 #include "io/tutti/tutti_service.hpp"
 #include "log/logging.hpp"
+#include "telemetry/nvtx.hpp"
 
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_factories.hpp>
@@ -244,6 +245,7 @@ tutti_spill_region tutti_spill_store::allocate(std::uint64_t bytes)
 {
   // A batch without buffers needs no file space.
   if (bytes == 0) { return tutti_spill_region{}; }
+  nvtx_scoped_range const control_range{"gsb::spill::control"};
 
   std::lock_guard lock(_mutex);
   if (_used_bytes == 0 && (_configured_dirs != flowcsd::config().spill_dirs ||
@@ -288,6 +290,7 @@ std::optional<tutti_spill_region> tutti_spill_store::allocate_in_dir(std::size_t
 void tutti_spill_store::release(tutti_spill_region const& region) noexcept
 {
   if (region.size_bytes == 0) { return; }
+  nvtx_scoped_range const control_range{"gsb::spill::control"};
 
   std::lock_guard lock(_mutex);
   _used_bytes -= region.size_bytes;
@@ -461,7 +464,9 @@ io::tutti::transfer_stats submit_spill_io(tutti_spill_store& store,
 
   auto& handle = store.kvikio_handle(region.file_index);
   std::vector<std::pair<std::size_t, std::future<std::size_t>>> futures;
+  std::optional<nvtx_scoped_range> io_range;
   if (writes != nullptr) {
+    io_range.emplace("gsb::spill::write");
     futures.reserve(writes->size());
     for (auto const& w : *writes) {
       futures.emplace_back(w.bytes,
@@ -475,7 +480,11 @@ io::tutti::transfer_stats submit_spill_io(tutti_spill_store& store,
   } else {
     // Drain stream-ordered buffer allocations on `stream` before KvikIO worker threads issue
     // synchronous cuFileRead into those buffers.
-    stream.sync();
+    {
+      nvtx_scoped_range const restore_range{"gsb::spill::restore"};
+      stream.sync();
+    }
+    io_range.emplace("gsb::spill::read");
     futures.reserve(reads->size());
     for (auto const& r : *reads) {
       futures.emplace_back(r.bytes,
@@ -516,6 +525,8 @@ std::unique_ptr<cucascade::idata_representation> convert_gpu_to_tutti_spill(
   ::cuda::stream_ref stream,
   [[maybe_unused]] cucascade::memory::reservation* reservation)
 {
+  // This converter is entered only for a selected GPU batch targeting the DISK tier.
+  std::optional<nvtx_scoped_range> control_range{std::in_place, "gsb::spill::control"};
   // Open the spill files (first spill only) before the timer: setup, not part of moving a batch.
   auto& store = tutti_spill_store::instance();
   flowcsd::timed_scope spill_timer{flowcsd::time_category::spill_write};
@@ -531,8 +542,12 @@ std::unique_ptr<cucascade::idata_representation> convert_gpu_to_tutti_spill(
   if (cudaEvent_t const writer_event = gpu_source.get_writer_event(); writer_event != nullptr) {
     cucascade::cuda::cuda_event_view{writer_event}.wait(stream);
   }
+  control_range.reset();
 
   // Plan the region layout.
+  // GDS writes the original buffers: pack measures layout/descriptor preparation, not a
+  // fabricated packing kernel. Tutti's actual GPU staging copies are marked in its service.
+  std::optional<nvtx_scoped_range> pack_range{std::in_place, "gsb::spill::pack"};
   std::size_t layout_bytes = 0;
   std::vector<cucascade::memory::column_metadata> columns;
   columns.reserve(static_cast<std::size_t>(table.num_columns()));
@@ -553,7 +568,10 @@ std::unique_ptr<cucascade::idata_representation> convert_gpu_to_tutti_spill(
     collect_column_writes(
       table.column(i), disk_columns[static_cast<std::size_t>(i)], region.offset_bytes, writes);
   }
+  pack_range.reset();
+  control_range.emplace("gsb::spill::control");
   stream.sync();
+  control_range.reset();
   prepare_trace.reset();
   std::uint64_t issued_bytes = 0;
   if (!writes.empty()) {
@@ -562,6 +580,7 @@ std::unique_ptr<cucascade::idata_representation> convert_gpu_to_tutti_spill(
     flowcsd::add_bytes(flowcsd::byte_counter::spill_write, transfer.issued_bytes);
     flowcsd::add_count(flowcsd::event_counter::io_requests, transfer.requests);
   }
+  control_range.emplace("gsb::spill::control");
   flowcsd::add_count(flowcsd::event_counter::spilled_batches, 1);
   // One line per batch: shows which drive (spill dir) every spill went to.
   SIRIUS_LOG_INFO("[flowcsd] spill write {} B ({} rows) to {} at {}",
@@ -722,6 +741,7 @@ std::unique_ptr<cucascade::idata_representation> convert_tutti_spill_to_gpu(
   ::cuda::stream_ref stream,
   [[maybe_unused]] cucascade::memory::reservation* reservation)
 {
+  nvtx_scoped_range const control_range{"gsb::spill::control"};
   flowcsd::timed_scope spill_timer{flowcsd::time_category::spill_read};
   nvtx3::scoped_range nvtx_range{"sirius::spill::tutti_to_gpu"};
   auto const& spilled = source.cast<tutti_spill_representation>();
@@ -739,6 +759,7 @@ std::unique_ptr<cucascade::idata_representation> convert_tutti_spill_to_gpu(
   column_buffers.reserve(columns.size());
   {
     flowcsd::trace_scope const prepare_trace{flowcsd::trace_category::spill_r_prepare};
+    nvtx_scoped_range const restore_range{"gsb::spill::restore"};
     for (auto const& meta : columns) {
       column_buffers.push_back(
         allocate_column_buffers(meta, region.offset_bytes, stream, mr, reads));
@@ -756,6 +777,7 @@ std::unique_ptr<cucascade::idata_representation> convert_tutti_spill_to_gpu(
   gpu_columns.reserve(columns.size());
   {
     flowcsd::trace_scope const unpack_trace{flowcsd::trace_category::spill_r_unpack};
+    nvtx_scoped_range const restore_range{"gsb::spill::restore"};
     for (std::size_t i = 0; i < columns.size(); ++i) {
       gpu_columns.push_back(
         build_restored_column(columns[i], std::move(column_buffers[i]), stream, mr));

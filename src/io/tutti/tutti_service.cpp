@@ -42,6 +42,7 @@
 #include "flowcsd/flowcsd_config.hpp"
 #include "flowcsd/flowcsd_stats.hpp"
 #include "log/logging.hpp"
+#include "telemetry/nvtx.hpp"
 
 #include <flowcsd_tutti_bridge.hpp>
 
@@ -574,6 +575,9 @@ class bridge_tutti_service final : public tutti_service {
                       staging_pool pool,
                       cudaStream_t stream) override
   {
+    // Only the spill staging pool carries SSD-spill provenance; scan reads remain unmarked.
+    std::optional<nvtx_scoped_range> control_range;
+    if (pool == staging_pool::spill) { control_range.emplace("gsb::spill::control"); }
     auto const plan = plan_reads(reads, _block_bytes, _piece_bytes);
     auto const& names = pool == staging_pool::scan ? kScanReadTrace : kSpillReadTrace;
     auto const dev    = flowcsd::trace_enabled() ? device_of(file_id) : -1;
@@ -587,15 +591,21 @@ class bridge_tutti_service final : public tutti_service {
       auto const round_end    = next_piece + spots.size();
 
       // NVMe -> slabs.
-      submit_and_wait(nvme_requests(bridge::io_direction::read,
-                                    file_id,
-                                    round_pieces.first(spots.size()),
-                                    spots),
-                      names,
-                      dev);
+      {
+        std::optional<nvtx_scoped_range> read_range;
+        if (pool == staging_pool::spill) { read_range.emplace("gsb::spill::read"); }
+        submit_and_wait(nvme_requests(bridge::io_direction::read,
+                                      file_id,
+                                      round_pieces.first(spots.size()),
+                                      spots),
+                        names,
+                        dev);
+      }
 
       // Slabs -> destinations: only the requested bytes, not the block padding.
       flowcsd::trace_scope copy_trace{names.copy};
+      std::optional<nvtx_scoped_range> restore_range;
+      if (pool == staging_pool::spill) { restore_range.emplace("gsb::spill::restore"); }
       sirius::cuda::device_copy_batch copies;
       std::uint64_t copied_bytes = 0;
       for (; next_copy < plan.copies.size() && plan.copies[next_copy].piece_index < round_end;
@@ -621,6 +631,8 @@ class bridge_tutti_service final : public tutti_service {
                        staging_pool pool,
                        cudaStream_t stream) override
   {
+    std::optional<nvtx_scoped_range> control_range;
+    if (pool == staging_pool::spill) { control_range.emplace("gsb::spill::control"); }
     auto const plan = plan_writes(writes, _block_bytes, _piece_bytes);
     auto const dev  = flowcsd::trace_enabled() ? device_of(file_id) : -1;
     rmm::cuda_set_device_raii const device{rmm::cuda_device_id{_bridge.accel_id()}};
@@ -636,6 +648,8 @@ class bridge_tutti_service final : public tutti_service {
       // so the copies must be complete before the requests are submitted.
       {
         flowcsd::trace_scope copy_trace{kSpillWriteTrace.copy};
+        std::optional<nvtx_scoped_range> pack_range;
+        if (pool == staging_pool::spill) { pack_range.emplace("gsb::spill::pack"); }
         sirius::cuda::device_copy_batch copies;
         std::uint64_t copied_bytes = 0;
         for (; next_copy < plan.copies.size() && plan.copies[next_copy].piece_index < round_end;
@@ -654,12 +668,16 @@ class bridge_tutti_service final : public tutti_service {
       }
 
       // Slabs -> NVMe.
-      submit_and_wait(nvme_requests(bridge::io_direction::write,
-                                    file_id,
-                                    round_pieces.first(spots.size()),
-                                    spots),
-                      kSpillWriteTrace,
-                      dev);
+      {
+        std::optional<nvtx_scoped_range> write_range;
+        if (pool == staging_pool::spill) { write_range.emplace("gsb::spill::write"); }
+        submit_and_wait(nvme_requests(bridge::io_direction::write,
+                                      file_id,
+                                      round_pieces.first(spots.size()),
+                                      spots),
+                        kSpillWriteTrace,
+                        dev);
+      }
       next_piece = round_end;
     }
     return transfer_stats{plan.requested_bytes, plan.issued_bytes, plan.pieces.size()};
