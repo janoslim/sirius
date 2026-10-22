@@ -39,6 +39,7 @@
 #include <op/scan/scan_utils.hpp>
 #include <op/scan/sirius_gpu_scan_operator_data.hpp>
 #include <scan_manager/sirius_scan_manager.hpp>
+#include <telemetry/nvtx.hpp>
 #include <transparent/read_view_registry.hpp>
 
 // cudf
@@ -1076,6 +1077,10 @@ std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
     }
     throw;
   }
+  // Everything after the footer up to the return plans this file's row groups:
+  // schema checks, filter translation, statistics pruning (cuDF
+  // filter_row_groups_with_stats, which runs GPU kernels) and size estimates.
+  nvtx_scoped_range const plan_range{"sirius::metadata::plan_row_groups"};
   // Mutate a private descriptor, never the published metadata store or file.
   if (!_info->injections.synthetic_parquet_codec.empty()) {
     auto copy = std::make_shared<cudf::io::parquet::FileMetaData>(*file_metadata);

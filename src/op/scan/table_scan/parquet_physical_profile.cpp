@@ -20,6 +20,7 @@
 #include "io/sirius_datasource.hpp"
 #include "op/scan/parquet_metadata.hpp"
 #include "op/scan/parquet_schema_mapping.hpp"
+#include "telemetry/nvtx.hpp"
 
 #include <cudf/io/experimental/hybrid_scan.hpp>
 #include <cudf/io/parquet_io_utils.hpp>
@@ -174,7 +175,14 @@ std::shared_ptr<parquet_metadata> resolve_parquet_metadata(
     return cached;
   }
   if (cache_hit) *cache_hit = false;
-  auto footer = fetch_plaintext_parquet_footer(source, contract, identity);
+  // NVTX ranges name the host metadata phases for the trace breakdown: the footer
+  // read (I/O and its wait), then the Thrift parse that lasts until the return.
+  std::unique_ptr<cudf::io::datasource::buffer> footer;
+  {
+    nvtx_scoped_range const read_range{"sirius::metadata::read_footer"};
+    footer = fetch_plaintext_parquet_footer(source, contract, identity);
+  }
+  nvtx_scoped_range const parse_range{"sirius::metadata::parse_footer"};
   crypto_reader probe({footer->data(), footer->size()});
   auto encryption = probe.read();
   if (!encryption.complete || probe.original_schema().empty()) {

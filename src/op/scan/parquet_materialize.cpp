@@ -21,6 +21,7 @@
 #include "io/io_context.hpp"
 #include "io/types.hpp"
 #include "op/scan/page_survival.hpp"
+#include "telemetry/nvtx.hpp"
 
 #include <cudf/io/datasource.hpp>
 #include <cudf/io/experimental/hybrid_scan_multifile.hpp>
@@ -58,6 +59,7 @@ std::vector<cudf::io::text::byte_range_info> column_chunk_ranges(
   std::vector<cudf::size_type> const& row_group_indices)
 {
   if (row_group_indices.empty()) { return {}; }
+  nvtx_scoped_range const plan_range{"sirius::metadata::plan_column_chunks"};
   hybrid_scan_reader reader(metadata, options);
   return reader.all_column_chunks_byte_ranges(
     cudf::host_span<cudf::size_type const>(row_group_indices.data(), row_group_indices.size()),
@@ -70,6 +72,7 @@ std::vector<cudf::io::text::byte_range_info> column_chunk_range_cache::ranges(
   std::vector<cudf::size_type> const& row_group_indices)
 {
   if (row_group_indices.empty()) { return {}; }
+  nvtx_scoped_range const plan_range{"sirius::metadata::plan_column_chunks"};
   if (!_reader || _metadata != metadata || _options != options) {
     _reader.reset();
     _reader   = std::make_unique<hybrid_scan_reader>(*metadata, *options);
@@ -405,7 +408,12 @@ std::unique_ptr<cudf::table> materialize_bulk(
     auto const& src   = sources.front();
     auto const chunks = fetch_chunks(src, options, ranges_for(ranges, 0), accounting, stream, mr);
 
-    hybrid_scan_reader reader(*src.metadata, options);
+    // Building the reader copies the footer and resolves the column selection on
+    // the host, so it gets its own metadata range ahead of the decode.
+    auto reader = [&] {
+      nvtx_scoped_range const setup_range{"sirius::metadata::setup_reader"};
+      return hybrid_scan_reader(*src.metadata, options);
+    }();
     auto result = timed_decode(
       [&] {
         return reader.materialize_all_columns(
@@ -448,9 +456,12 @@ std::unique_ptr<cudf::table> materialize_bulk(
     rg_per_src.push_back(sources[i].row_group_indices);
   }
 
-  cudf::io::parquet::experimental::hybrid_scan_multifile reader(
-    cudf::host_span<cudf::io::parquet::FileMetaData const>(metadatas.data(), metadatas.size()),
-    options);
+  auto reader = [&] {
+    nvtx_scoped_range const setup_range{"sirius::metadata::setup_reader"};
+    return hybrid_scan_multifile(
+      cudf::host_span<cudf::io::parquet::FileMetaData const>(metadatas.data(), metadatas.size()),
+      options);
+  }();
   auto result = timed_decode(
     [&] {
       return reader.materialize_all_columns(
@@ -548,6 +559,7 @@ bool can_skip_pages(std::span<parquet_source const> sources,
 std::shared_ptr<FileMetaData const> load_page_index(parquet_source const& src,
                                                     cudf::io::parquet_reader_options const& options)
 {
+  nvtx_scoped_range const load_range{"sirius::metadata::load_page_index"};
   hybrid_scan_reader const reader(*src.metadata, options);
   auto const range = reader.page_index_byte_range();
   std::vector<std::uint8_t> bytes(static_cast<std::size_t>(range.size()));
