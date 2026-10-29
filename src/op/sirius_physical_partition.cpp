@@ -856,11 +856,23 @@ bool sirius_physical_partition::late_build_batch_goes_to_managed_memory(
     // Keep the first max_build_hash_table_bytes of the build in device memory, so a build that
     // turns out small enough runs exactly as without the option.
     if (_arrived_build_bytes <= join.max_build_hash_table_bytes()) { return false; }
-    choose_late_build_moves(join);
-    if (_late_build_moves == late_build_moves::stopped) { return false; }
+    _late_build_moves = late_build_moves::moving;
+    SIRIUS_LOG_INFO(
+      "[flowcsd] partition id {} build passed max_build_hash_table_bytes {} at {} rows, {} bytes: "
+      "build batches from this one on move into host-resident managed memory while the build can "
+      "be one cuDF table",
+      this->get_operator_id(),
+      join.max_build_hash_table_bytes(),
+      _arrived_build_rows,
+      _arrived_build_bytes);
   }
-  // Over one cuDF table the strategy partitions the join: later batches stay in device memory as
-  // for any partitioned build, and the batches moved so far stay where they are.
+  // The strategy partitions a build over one cuDF table, so batches moved for it are wasted copies
+  // (78 GB for Q3 at SF=1000, Slurm job 1183). Stop at the first projection of the build's rows
+  // that says so, and in any case once the arrived rows say so; the batches moved by then stay.
+  if (_build_row_projection.empty() && projected_build_exceeds_one_table()) {
+    _late_build_moves = late_build_moves::stopped;
+    return false;
+  }
   if (_arrived_build_rows > MAX_CUDF_TABLE_ROWS) {
     _late_build_moves = late_build_moves::stopped;
     SIRIUS_LOG_INFO(
@@ -871,7 +883,7 @@ bool sirius_physical_partition::late_build_batch_goes_to_managed_memory(
       _arrived_build_bytes,
       MAX_CUDF_TABLE_ROWS,
       _moved_build_bytes,
-      _build_row_projection);
+      _build_row_projection.empty() ? "no input projection" : _build_row_projection);
     return false;
   }
   if (!in_device_memory) { return false; }
@@ -879,45 +891,43 @@ bool sirius_physical_partition::late_build_batch_goes_to_managed_memory(
   return true;
 }
 
-void sirius_physical_partition::choose_late_build_moves(sirius_physical_hash_join const& join)
+bool sirius_physical_partition::projected_build_exceeds_one_table()
 {
   // The planner's row estimate cannot decide: DuckDB put the 3.2-billion-row Q3 build at SF=1000 at
-  // 400 million rows (Slurm job 1183). Instead project this PARTITION's input bytes with the
-  // estimator behind estimated_total_input_bytes(), which only aggregate partitions enable, and
-  // convert them at the bytes per row arrived so far.
+  // 400 million rows (Slurm job 1183). Project this PARTITION's input bytes instead, with the
+  // estimator behind estimated_total_input_bytes() (which only aggregate partitions enable). It has
+  // no answer until the producer pipeline has completed enough tasks, which was never the case
+  // when a build first passed max_build_hash_table_bytes (Slurm job 1200), hence the retries.
   auto const estimate = pipeline::estimate_port_total_input_bytes(*this, "default");
+  if (!estimate.has_value() || _arrived_build_rows == 0) { return false; }
+  // An estimate cannot invalidate bytes already received; rows follow at the row width so far.
+  uint64_t const projected_bytes =
+    std::max(static_cast<uint64_t>(estimate->bytes), _arrived_build_bytes);
+  uint64_t const projected_rows =
+    scale_rows(_arrived_build_rows, projected_bytes, _arrived_build_bytes);
   double const bytes_per_row =
-    _arrived_build_rows == 0
-      ? 0.0
-      : static_cast<double>(_arrived_build_bytes) / static_cast<double>(_arrived_build_rows);
-  std::optional<uint64_t> projected_rows;
-  _build_row_projection = "no input projection";
-  if (estimate.has_value() && _arrived_build_rows > 0) {
-    // An estimate cannot invalidate bytes already received.
-    uint64_t const projected_bytes =
-      std::max(static_cast<uint64_t>(estimate->bytes), _arrived_build_bytes);
-    projected_rows = scale_rows(_arrived_build_rows, projected_bytes, _arrived_build_bytes);
-    _build_row_projection =
-      std::format("input projected at {} bytes (exact={}, hops={}, samples={}) = {} rows",
-                  projected_bytes,
-                  estimate->exact,
-                  estimate->hops,
-                  estimate->ratio_samples,
-                  *projected_rows);
-  }
-  bool const too_long = projected_rows.has_value() && *projected_rows > MAX_CUDF_TABLE_ROWS;
-  _late_build_moves   = too_long ? late_build_moves::stopped : late_build_moves::moving;
+    static_cast<double>(_arrived_build_bytes) / static_cast<double>(_arrived_build_rows);
+  _build_row_projection = std::format(
+    "input projected at {} bytes (exact={}, hops={}, samples={}) / {:.2f} bytes per row = {} rows",
+    projected_bytes,
+    estimate->exact,
+    estimate->hops,
+    estimate->ratio_samples,
+    bytes_per_row,
+    projected_rows);
+  bool const too_long = projected_rows > MAX_CUDF_TABLE_ROWS;
   SIRIUS_LOG_INFO(
-    "[flowcsd] partition id {} build passed max_build_hash_table_bytes {} at {} rows, {} bytes "
-    "({:.2f} bytes/row); {}; {}",
+    "[flowcsd] partition id {} {} with {} rows, {} bytes arrived and {} bytes moved into managed "
+    "memory; {}",
     this->get_operator_id(),
-    join.max_build_hash_table_bytes(),
+    _build_row_projection,
     _arrived_build_rows,
     _arrived_build_bytes,
-    bytes_per_row,
-    _build_row_projection,
-    too_long ? "no build batch moves into managed memory: the projected rows exceed one cuDF table"
-             : "build batches from this one on move into host-resident managed memory");
+    _moved_build_bytes,
+    too_long
+      ? "over one cuDF table: no more build batches move, the moved ones stay in managed memory"
+      : "within one cuDF table: build batches keep moving");
+  return too_long;
 }
 
 sirius_physical_hash_join* sirius_physical_partition::accumulated_filter_join() const noexcept

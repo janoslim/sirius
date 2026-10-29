@@ -198,11 +198,13 @@ class sirius_physical_partition : public sirius_physical_operator {
    * @brief Setting (라): count an arriving build batch and decide whether it moves into managed
    * memory.
    *
-   * Nothing moves while the arrived build is within `max_build_hash_table_bytes`. At the batch
-   * that passes it, choose_late_build_moves decides from the projected build rows whether batches
-   * move at all. They then move until the arrived rows exceed one cuDF table (`cudf::size_type`):
-   * the strategy partitions such a join, so moving more would only cost copies. The batches moved
-   * by then stay in managed memory. The stop is logged at INFO.
+   * Nothing moves while the arrived build is within `max_build_hash_table_bytes`. From the batch
+   * that passes it, batches move while the build can be one cuDF table (`cudf::size_type` rows):
+   * the strategy partitions a longer build, so moving its batches would only cost copies. Moving
+   * stops at the first projection of the build's rows over that (projected_build_exceeds_one_table,
+   * tried with every batch until the estimator answers), and in any case once the arrived rows
+   * exceed it. The batches moved by then stay in managed memory. The pass over the budget, the
+   * projection and a stop are logged at INFO.
    *
    * @param join The downstream join
    * @param rows Rows of the batch
@@ -217,16 +219,16 @@ class sirius_physical_partition : public sirius_physical_operator {
                                                              bool in_device_memory);
 
   /**
-   * @brief Setting (라): when the arrived build first passes `max_build_hash_table_bytes`, decide
-   * whether build batches move into managed memory at all, and log the decision at INFO.
+   * @brief Setting (라): try to project the build's total rows, from this PARTITION's projected
+   * input bytes at the bytes per row arrived so far, and report whether they exceed one cuDF table.
    *
-   * Projects the build's total rows from this PARTITION's projected input bytes at the bytes per
-   * row arrived so far; no batch moves when that exceeds one cuDF table. The projection may be
-   * unavailable, in which case batches move.
+   * Without an estimate (the producer pipeline has not completed enough tasks) it returns false and
+   * leaves `_build_row_projection` empty. Otherwise it records the projection there and logs it at
+   * INFO with the arrived rows and bytes and the bytes moved.
    *
    * @pre `_managed_build_mutex` is held.
    */
-  void choose_late_build_moves(sirius_physical_hash_join const& join);
+  [[nodiscard]] bool projected_build_exceeds_one_table();
 
   /**
    * @brief Decides once, before the first batch leaves the input repository, whether the join
@@ -347,7 +349,8 @@ class sirius_physical_partition : public sirius_physical_operator {
   uint64_t _arrived_build_bytes{0};
   /// Bytes of the arrived build batches moved into managed memory.
   uint64_t _moved_build_bytes{0};
-  /// The build-row projection of choose_late_build_moves, as logged; repeated in the stop line.
+  /// The first projection of the build's rows (projected_build_exceeds_one_table), as logged;
+  /// empty until the estimator answers, which is what makes later batches retry it.
   std::string _build_row_projection;
 
   /// Enabled only for grouped-aggregation partitions.
