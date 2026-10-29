@@ -157,6 +157,11 @@ class sirius_physical_partition : public sirius_physical_operator {
    * @brief Records each batch pushed into the build side's FULL `default` port in the arrival
    * ledger, when the downstream join accumulates dynamic filters.
    *
+   * Setting (라) of the FlowCSD fork: first moves a late build batch into managed memory (see
+   * keep_late_build_batch_in_managed_memory); that takes the batch's exclusive lock and copies its
+   * device data, an exception to the hook's rule that holds because the batch is fresh output of
+   * the pushing task and not yet poppable.
+   *
    * @throw std::logic_error if a batch arrives after the ledger was certified
    */
   void on_input_batch_pushed(std::string_view port_id, cucascade::data_batch& batch) override;
@@ -164,9 +169,27 @@ class sirius_physical_partition : public sirius_physical_operator {
  private:
   /**
    * @brief The downstream join if this is the build side of a non-broadcast HASH partition with
-   * more than one partition and the join accumulates dynamic filters; otherwise null.
+   * more than one partition, or of a join that keeps its hash-table state in managed memory
+   * (setting (라), one partition), and the join accumulates dynamic filters; otherwise null.
    */
   [[nodiscard]] sirius_physical_hash_join* accumulated_filter_join() const noexcept;
+
+  /**
+   * @brief Setting (라): move @p batch into managed memory once the build arrived so far, @p batch
+   * included, exceeds `max_build_hash_table_bytes`.
+   *
+   * The build arriving through the FULL input waits whole before the join chooses its strategy, so
+   * a build too large for one device-memory hash table would fill the GPU memory space first. The
+   * first batches up to `max_build_hash_table_bytes` stay in device memory (a build that small
+   * still runs as before); every GPU batch from the one that would cross it is copied into managed
+   * memory and its device copy freed before the batch becomes poppable, counted in the query's
+   * `managed_build_copy` bytes.
+   *
+   * @param join The downstream join, which may keep its hash-table state in managed memory
+   * @param batch The arriving batch; its representation is replaced in place
+   */
+  void keep_late_build_batch_in_managed_memory(sirius_physical_hash_join const& join,
+                                               cucascade::data_batch& batch);
 
   /**
    * @brief Decides once, before the first batch leaves the input repository, whether the join
@@ -260,7 +283,8 @@ class sirius_physical_partition : public sirius_physical_operator {
   duckdb::SiriusContext* _compressed_materialization_observer = nullptr;
   /// Ledger of build-side arrivals, for the join to certify its dynamic filter accumulation. Only
   /// used when the join accumulates a filter from this input, which is only true for
-  /// non-broadcast HASH joins with more than one partition. See decide_accumulation().
+  /// non-broadcast HASH joins with more than one partition or with their hash-table state in
+  /// managed memory. See decide_accumulation().
   build_arrival_ledger _arrival_ledger;
   /// Serializes decide_accumulation().
   std::mutex _accumulation_mutex;
@@ -269,6 +293,15 @@ class sirius_physical_partition : public sirius_physical_operator {
   /// The join whose accumulation `decide_accumulation` started, or null: tasks skip the publication
   /// session entirely without one.
   std::atomic<sirius_physical_hash_join*> _accumulating_join{nullptr};
+
+  /// Setting (라), keep_late_build_batch_in_managed_memory: serializes the two fields below, which
+  /// concurrent pushing tasks update.
+  std::mutex _managed_build_mutex;
+  /// Bytes of the arrived build batches kept in device memory.
+  uint64_t _device_build_bytes{0};
+  /// Set once an arriving batch did not fit under `max_build_hash_table_bytes`: every later GPU
+  /// batch goes to managed memory too.
+  bool _build_overflows_to_managed_memory{false};
 
   /// Enabled only for grouped-aggregation partitions.
   bool _enable_size_estimation{false};

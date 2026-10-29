@@ -521,6 +521,9 @@ struct gpu_mem_config {
   // FlowCSD fork: allocate the GPU memory space from CUDA managed memory, so usage_limit_bytes may
   // exceed the GPU and the driver pages data to host memory (memory/managed_gpu_memory.hpp).
   bool managed_memory{false};
+  // FlowCSD fork, setting (라): only large hash joins keep their hash-table state in managed memory
+  // (memory/managed_hash_join_memory.hpp).
+  managed_hash_join_config managed_hash_join{};
 
   static void from_yaml(const YAML::Node& node, gpu_mem_config& opt)
   {
@@ -546,6 +549,9 @@ struct gpu_mem_config {
       "downgrade_trigger_fraction", opt.downgrade_trigger_fraction, yaml::fraction<double>{});
     r.optional("downgrade_stop_fraction", opt.downgrade_stop_fraction, yaml::fraction<double>{});
     r.optional("managed_memory", opt.managed_memory);
+    r.optional("large_hash_join_in_managed_memory", opt.managed_hash_join.enabled);
+    // Any spelling other than migrate_on_access / host_resident fails as an invalid enum value.
+    r.optional("managed_hash_join_placement", opt.managed_hash_join.placement);
     r.reject_unknown();
     validate_downgrade_fractions(
       "sirius.memory.gpu", opt.downgrade_trigger_fraction, opt.downgrade_stop_fraction);
@@ -880,6 +886,14 @@ try {
       "sirius.memory.gpu.managed_memory and sirius.flowcsd.direct_disk_spill are mutually "
       "exclusive");
   }
+  // Setting (라) splits GPU memory into the device-memory GPU memory space and the managed hash-table
+  // state of large joins; with the whole space on managed memory there is no such split to make.
+  if (gpu_cfg.managed_hash_join.enabled && gpu_cfg.managed_memory) {
+    throw std::runtime_error(
+      "sirius.memory.gpu.large_hash_join_in_managed_memory and sirius.memory.gpu.managed_memory are "
+      "mutually exclusive");
+  }
+  settings._managed_hash_join_config = gpu_cfg.managed_hash_join;
 
   // Explicit space configs (low-level API)
   if (auto space_node = r.optional_node("space")) {
@@ -970,6 +984,19 @@ try {
       }
     }
     settings._memory_space_configs = builder.build(hw_topology);
+  }
+  // Setting (라) keeps one process-wide managed pool and routes cuDF's allocations on one device
+  // (memory/managed_hash_join_memory.hpp); several GPUs would need per-device pools and routing.
+  if (settings._managed_hash_join_config.enabled) {
+    auto const num_gpus =
+      std::ranges::count_if(settings._memory_space_configs, [](auto const& space) {
+        return std::holds_alternative<cucascade::memory::gpu_memory_space_config>(space);
+      });
+    if (num_gpus != 1) {
+      throw configuration_input_error(
+        "sirius.memory.gpu.large_hash_join_in_managed_memory supports exactly one GPU, but " +
+        std::to_string(num_gpus) + " are configured");
+    }
   }
 
   const auto defaults =

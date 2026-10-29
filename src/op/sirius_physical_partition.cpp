@@ -21,6 +21,7 @@
 #include "data/data_batch_utils.hpp"
 #include "flowcsd/flowcsd_stats.hpp"
 #include "log/logging.hpp"
+#include "memory/managed_hash_join_memory.hpp"
 #include "memory/size_arithmetic.hpp"
 #include "op/partition/gpu_partition_impl.hpp"
 #include "op/sirius_physical_concat.hpp"
@@ -32,6 +33,9 @@
 #include "sirius/exception.hpp"
 #include "sirius_context.hpp"
 #include "telemetry/nvtx.hpp"
+
+#include <rmm/cuda_device.hpp>
+#include <rmm/detail/error.hpp>
 
 #include <algorithm>
 #include <cmath>
@@ -206,17 +210,29 @@ std::unique_ptr<operator_data> sirius_physical_partition::execute(const operator
     }
   };
 
+  auto* const accumulating = _accumulating_join.load(std::memory_order_acquire);
+
   // Broadcast mode never hash-partitions: the build side replicates its (small) batch to every
   // slot and the probe side streams through unpartitioned. In both cases execute() just forwards
   // the input batches; the fan-out to slots happens in sink().
   if (_broadcast || _num_partitions.value() < 2 || _partition_keys.empty()) {
+    // Setting (라): a join that keeps its hash-table state in managed memory runs in one partition
+    // but accumulates its dynamic filter from every build batch, like the partitioned join below.
+    // No other join accumulates on this path (accumulated_filter_join).
+    std::optional<std::uint64_t> publication_id;
+    if (accumulating != nullptr) {
+      publication_id =
+        contribute_to_accumulated_filter(*accumulating, input, input_batch_ro, stream);
+    }
     auto result = std::make_unique<pipelineable_operator_data>(input.get_data_batches());
+    if (publication_id) {
+      accumulating->dynamic_filter_session().publish_if_final(*publication_id, *space, stream);
+    }
     record_actual_bytes();
     return result;
   }
 
   std::vector<std::shared_ptr<cucascade::data_batch>> partitioned_results;
-  auto* const accumulating = _accumulating_join.load(std::memory_order_acquire);
   std::optional<std::uint64_t> publication_id;
   switch (_partition_type) {
     case PartitionType::HASH:
@@ -667,7 +683,11 @@ std::unique_ptr<operator_data> sirius_physical_partition::get_next_task_input_da
                                    "to fold the build into a "
                                    "single batch (concat_all)");
         }
-        build_arrives_whole = strategy.num_partitions == 1 || strategy.broadcast;
+        // Setting (라): a managed join's build is too large for a whole-build filter in device
+        // memory; it accumulates a Bloom filter from its build batches instead, as the partitioned
+        // join it replaces does (accumulated_filter_join).
+        build_arrives_whole =
+          !strategy.managed_hash_state && (strategy.num_partitions == 1 || strategy.broadcast);
       } else if (in.is_build_side && strategy.num_partitions == 1 && hash_join != nullptr &&
                  hash_join->publishes_dynamic_filters() &&
                  in.total_bytes < hash_join->max_build_hash_table_bytes()) {
@@ -763,10 +783,58 @@ void sirius_physical_partition::on_input_batch_pushed(std::string_view port_id,
 {
   if (port_id != "default" || !_is_build || _partition_type != PartitionType::HASH) { return; }
   auto const* join = dynamic_cast<sirius_physical_hash_join const*>(_downstream_consumer_op);
-  if (join == nullptr || !join->dynamic_filter_plan().multi_partition_enabled()) { return; }
+  if (join == nullptr) { return; }
+  // Setting (라); false while the option is off. The managed path folds the build through the
+  // build-side CONCAT, like BUILD_PROBE (build_foldable).
+  if (join->may_keep_hash_state_in_managed_memory() &&
+      std::ranges::any_of(get_next_ports_after_sink(), [](next_port_info const& next_port) {
+        return next_port.next_operator->type == SiriusPhysicalOperatorType::CONCAT &&
+               next_port.next_operator->Cast<sirius_physical_concat>().is_build_concat();
+      })) {
+    keep_late_build_batch_in_managed_memory(*join, batch);
+  }
+  if (!join->dynamic_filter_plan().multi_partition_enabled()) { return; }
   auto const* port = try_get_port(port_id);
   if (port == nullptr || port->type != MemoryBarrierType::FULL) { return; }
   _arrival_ledger.record(batch);
+}
+
+void sirius_physical_partition::keep_late_build_batch_in_managed_memory(
+  sirius_physical_hash_join const& join, cucascade::data_batch& batch)
+{
+  auto mutable_batch = batch.to_mutable();
+  auto* data         = mutable_batch.get_data();
+  // Only a GPU table can be copied; a batch already in managed memory (pushed twice) stays.
+  auto* gpu = dynamic_cast<cucascade::gpu_table_representation*>(data);
+  if (gpu == nullptr || memory::is_managed_hash_state(data)) { return; }
+
+  // Keep the first max_build_hash_table_bytes of the build in device memory, so a build that
+  // turns out small enough runs exactly as without the option.
+  auto const bytes = data->get_size_in_bytes();
+  {
+    std::lock_guard const lock(_managed_build_mutex);
+    if (!_build_overflows_to_managed_memory &&
+        _device_build_bytes + bytes <= join.max_build_hash_table_bytes()) {
+      _device_build_bytes += bytes;
+      return;
+    }
+    _build_overflows_to_managed_memory = true;
+  }
+
+  // Copy on a stream of the batch's GPU memory space, after the batch's producer finished writing.
+  auto* space = mutable_batch.get_memory_space();
+  rmm::cuda_set_device_raii const device{rmm::cuda_device_id{space->get_device_id()}};
+  auto const stream = space->acquire_stream();
+  if (cudaEvent_t const writer = gpu->get_writer_event(); writer != nullptr) {
+    RMM_CUDA_TRY(cudaStreamWaitEvent(stream.get(), writer, 0));
+  }
+  auto managed = std::make_unique<cucascade::gpu_table_representation>(
+    memory::copy_to_managed_hash_state(gpu->get_table_view(), stream), *space, stream);
+  auto const managed_bytes = managed->get_size_in_bytes();
+  // set_data frees the device copy, which the copy must have finished reading.
+  stream.sync();
+  mutable_batch.set_data(std::move(managed));
+  flowcsd::add_bytes(flowcsd::byte_counter::managed_build_copy, managed_bytes);
 }
 
 sirius_physical_hash_join* sirius_physical_partition::accumulated_filter_join() const noexcept
@@ -776,13 +844,15 @@ sirius_physical_hash_join* sirius_physical_partition::accumulated_filter_join() 
       _partition_type != PartitionType::HASH ||
       _broadcast ||
       !_num_partitions ||
-      *_num_partitions <= 1 ||
       _partition_keys.empty()) {
     // clang-format on
     return nullptr;
   }
   auto* join = dynamic_cast<sirius_physical_hash_join*>(_downstream_consumer_op);
-  return join != nullptr && join->dynamic_filter_plan().multi_partition_enabled() ? join : nullptr;
+  if (join == nullptr || !join->dynamic_filter_plan().multi_partition_enabled()) { return nullptr; }
+  // Setting (라): a join with its hash-table state in managed memory runs in one partition but
+  // accumulates its filter like the partitioned join it replaces.
+  return *_num_partitions > 1 || join->keeps_hash_state_in_managed_memory() ? join : nullptr;
 }
 
 bool sirius_physical_partition::decide_accumulation()
@@ -809,8 +879,9 @@ bool sirius_physical_partition::decide_accumulation()
     } else if (!input->src_pipeline->is_pipeline_finished()) {
       return false;
     } else if (auto inventory = _arrival_ledger.certify(
-                 {.repository_batches = input->repo->size(0),
-                  .partition_count    = static_cast<std::size_t>(*_num_partitions)});
+                 {.repository_batches            = input->repo->size(0),
+                  .partition_count               = static_cast<std::size_t>(*_num_partitions),
+                  .single_partition_accumulation = join->keeps_hash_state_in_managed_memory()});
                !inventory) {
       declined = "the arrival ledger does not match the build input";
     } else if (session.try_begin_accumulation(std::move(inventory))) {

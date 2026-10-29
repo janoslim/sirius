@@ -18,6 +18,7 @@
 #include "memory/sirius_memory_reservation_manager.hpp"
 
 #include "cucascade/memory/common.hpp"
+#include "memory/managed_hash_join_memory.hpp"
 
 #include <cudf/utilities/memory_resource.hpp>
 
@@ -27,24 +28,46 @@
 
 #include <cucascade/memory/memory_reservation_manager.hpp>
 
+#include <string>
+
 namespace sirius {
 namespace memory {
 
 sirius_memory_reservation_manager::sirius_memory_reservation_manager(
-  const std::vector<cucascade::memory::memory_space_config>& configs)
+  const std::vector<cucascade::memory::memory_space_config>& configs,
+  managed_hash_join_config const& managed_hash_join)
   : cucascade::memory::memory_reservation_manager(configs)
 {
   auto gpu_spaces = this->get_memory_spaces_for_tier(cucascade::memory::Tier::GPU);
   if (gpu_spaces.empty()) {
     throw std::runtime_error("At least one GPU memory space must be configured");
   }
+  // Setting (라): the process-wide managed hash-state pool on the one GPU (the configuration
+  // already rejects several GPUs; memory/managed_hash_join_memory.hpp).
+  managed_hash_state_pool* managed_pool = nullptr;
+  if (managed_hash_join.enabled) {
+    if (gpu_spaces.size() != 1) {
+      throw std::runtime_error(
+        "sirius.memory.gpu.large_hash_join_in_managed_memory supports exactly one GPU, but " +
+        std::to_string(gpu_spaces.size()) + " GPU memory spaces exist");
+    }
+    managed_pool = &install_managed_hash_state_pool(gpu_spaces.front()->get_device_id(),
+                                                    managed_hash_join.placement);
+  }
   for (const auto* space : gpu_spaces) {
     auto const device_mr = space->get_default_allocator();
     rmm::cuda_set_device_raii set_device{rmm::cuda_device_id{space->get_device_id()}};
     // Capture the old resource by value (not by ref) — see comment in header for why.
     // Wrap device_async_resource_ref in any_resource to satisfy the non-deprecated API.
-    prev_device_mrs_.push_back(cudf::set_current_device_resource(
-      ::cuda::mr::any_resource<::cuda::mr::device_accessible>{device_mr}));
+    if (managed_pool != nullptr) {
+      // cuDF's hash-join objects take no memory resource, so the router places them per thread.
+      prev_device_mrs_.push_back(cudf::set_current_device_resource(
+        ::cuda::mr::any_resource<::cuda::mr::device_accessible>{
+          managed_hash_join_router{device_mr, *managed_pool}}));
+    } else {
+      prev_device_mrs_.push_back(cudf::set_current_device_resource(
+        ::cuda::mr::any_resource<::cuda::mr::device_accessible>{device_mr}));
+    }
   }
 }
 

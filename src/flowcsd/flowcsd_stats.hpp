@@ -89,6 +89,9 @@ enum class byte_counter : std::uint8_t {
   host_spill_write,      ///< bytes the downgrade executor moved into the HOST tier (0 with direct spill)
   spill_unread,          ///< spilled bytes whose batch was dropped before being read back
   spill_live_peak,       ///< largest spill-store occupancy seen during the query (a maximum, not a sum)
+  managed_build_copy,    ///< build-side batch bytes copied from GPU device memory into managed memory
+                         ///< (sirius.memory.gpu.large_hash_join_in_managed_memory)
+  managed_hash_state_peak,  ///< largest managed hash-join state live during the query (a maximum)
   count
 };
 
@@ -101,6 +104,7 @@ enum class event_counter : std::uint8_t {
   spilled_batches,   ///< batches written by direct spill
   restored_batches,  ///< spilled batches read back
   hash_partitions,   ///< partitions produced by PARTITION operators (latched counts, summed)
+  managed_hash_joins,  ///< hash joins that built their hash table in managed memory
   count
 };
 

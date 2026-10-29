@@ -39,9 +39,11 @@
 #include "expression/ast/utils.hpp"
 #include "expression_evaluator/ast_supported_types.hpp"
 #include "expression_evaluator/gpu_expression_translator_internal.hpp"
+#include "flowcsd/flowcsd_stats.hpp"
 #include "helper/numeric_narrowing.hpp"
 #include "helper/type_conversions.hpp"
 #include "log/logging.hpp"
+#include "memory/managed_hash_join_memory.hpp"
 #include "op/dynamic_filter/dynamic_filter_publisher.hpp"
 #include "op/dynamic_filter/sirius_dynamic_filter.hpp"
 #include "op/join_key_preparation.hpp"
@@ -63,12 +65,14 @@
 
 #include <algorithm>
 #include <cassert>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <format>
 #include <limits>
 #include <optional>
 #include <stdexcept>
+#include <string>
 #include <string_view>
 #include <unordered_map>
 #include <unordered_set>
@@ -853,7 +857,9 @@ partition_strategy compute_hash_join_partition_strategy(uint64_t total_bytes,
                                                         uint64_t max_broadcast_join_size,
                                                         duckdb::JoinType join_type,
                                                         HASH_JOIN_MODE join_mode,
-                                                        double estimated_probe_to_build_ratio)
+                                                        double estimated_probe_to_build_ratio,
+                                                        bool large_hash_join_in_managed_memory,
+                                                        uint64_t build_rows)
 {
   // Without a GPU list (engine-free tests) plan as a single GPU and leave partitions unpinned.
   int const num_gpus = std::max(1, static_cast<int>(active_gpu_ids.size()));
@@ -901,8 +907,10 @@ partition_strategy compute_hash_join_partition_strategy(uint64_t total_bytes,
   int const build_probe_partitions = std::max(1, std::min(natural, num_gpus));
   uint64_t const per_gpu_build_bytes =
     broadcast_candidate ? total_bytes : total_bytes / static_cast<uint64_t>(build_probe_partitions);
-  bool build_probe = per_gpu_build_bytes < max_build_hash_table_bytes && build_foldable &&
-                     !is_right_family && !is_mixed && !is_full_outer;
+  // One hash table per partition can serve the join; right-family, mixed and full-outer joins
+  // would over-emit build rows on the streamed path.
+  bool const one_table_join = build_foldable && !is_right_family && !is_mixed && !is_full_outer;
+  bool build_probe = per_gpu_build_bytes < max_build_hash_table_bytes && one_table_join;
 
   // A MARK join must always run in BUILD_PROBE mode. It needs the entire build side resident to
   // compute the global build_has_null sentinel and the per-probe-row marks, and on multi-GPU it is
@@ -911,7 +919,18 @@ partition_strategy compute_hash_join_partition_strategy(uint64_t total_bytes,
   // rejected at construction.
   if (is_mark) { build_probe = true; }
 
-  bool const broadcast = broadcast_candidate && build_probe;
+  // Setting (라) of the FlowCSD fork: a join that one hash table can serve but whose build is over
+  // the hash-table budget runs unpartitioned with its hash-table state in managed memory, provided
+  // the build fits one cuDF table (the folded build batch is a single cudf::table).
+  bool const managed_hash_state =
+    large_hash_join_in_managed_memory && one_table_join &&
+    per_gpu_build_bytes >= max_build_hash_table_bytes &&
+    build_rows <= static_cast<uint64_t>(std::numeric_limits<cudf::size_type>::max());
+  if (managed_hash_state) { build_probe = true; }
+
+  // A managed join is never broadcast: like the partitioned join it replaces, it accumulates its
+  // dynamic filter from the build batches, which a broadcast build does not do.
+  bool const broadcast = broadcast_candidate && build_probe && !managed_hash_state;
 
   // BUILD_PROBE runs at the count its eligibility was measured at; MARK single-GPU is clamped to
   // one partition; broadcast takes one partition per GPU; everything else the natural count.
@@ -933,7 +952,8 @@ partition_strategy compute_hash_join_partition_strategy(uint64_t total_bytes,
                           ? partition_placement::unpinned(1)
                           : partition_placement::round_robin(
                               static_cast<std::size_t>(num_partitions), active_gpu_ids));
-  return partition_strategy{num_partitions, broadcast, build_probe, std::move(placement)};
+  return partition_strategy{
+    num_partitions, broadcast, build_probe, std::move(placement), managed_hash_state};
 }
 
 std::optional<std::size_t> sirius_physical_hash_join::consumed_primary_input_bytes() const
@@ -976,7 +996,9 @@ partition_strategy sirius_physical_hash_join::get_partition_strategy(
                                                              _max_broadcast_join_size,
                                                              join_type,
                                                              _join_mode,
-                                                             estimated_probe_to_build_ratio);
+                                                             estimated_probe_to_build_ratio,
+                                                             memory::managed_hash_state() != nullptr,
+                                                             in.total_rows);
 
   if (join_type == duckdb::JoinType::MARK && num_gpus() > 1 && in.is_build_side &&
       in.total_bytes >= partition_small_table_bytes(num_gpus())) {
@@ -996,6 +1018,17 @@ partition_strategy sirius_physical_hash_join::get_partition_strategy(
       std::vector<per_partition_build_state>(static_cast<std::size_t>(strategy.num_partitions));
   }
   if (strategy.broadcast) { _broadcast = true; }
+  if (strategy.managed_hash_state) {
+    _managed_hash_state.store(true, std::memory_order_release);
+    SIRIUS_LOG_INFO(
+      "[flowcsd] hash join id {} ({}) runs unpartitioned with its hash-table state in managed "
+      "memory: build {} bytes, {} rows, max_build_hash_table_bytes {}",
+      this->get_operator_id(),
+      duckdb::JoinTypeToString(join_type),
+      in.total_bytes,
+      in.total_rows,
+      _max_build_hash_table_bytes);
+  }
 
   // Pre-size the build and probe input repositories so every partition slot exists before batches
   // arrive. Gated on > 1 (a single partition needs no growth).
@@ -1034,6 +1067,15 @@ bool sirius_physical_hash_join::is_build_probe_mode()
 {
   std::lock_guard<std::mutex> lg(op_state_mutex);
   return _join_mode == HASH_JOIN_MODE::BUILD_PROBE;
+}
+
+bool sirius_physical_hash_join::may_keep_hash_state_in_managed_memory() const noexcept
+{
+  // The type and mode conditions of one_table_join in compute_hash_join_partition_strategy; the
+  // build-side CONCAT (build_foldable) is checked by the PARTITION that asks.
+  return memory::managed_hash_state() != nullptr && !is_right_family() &&
+         join_type != duckdb::JoinType::OUTER &&
+         _join_mode.load(std::memory_order_acquire) != HASH_JOIN_MODE::MIXED_JOIN;
 }
 
 bool sirius_physical_hash_join::publishes_dynamic_filters() const
@@ -1913,6 +1955,13 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
           std::to_string(this->get_operator_id()));
       }
       auto const& build_batch_ro = input_batches[1];
+      // Setting (라): a managed join allocates its build keys' cast columns and its cuDF hash table
+      // (cuco storage and preprocessed build table) in managed memory. The scope closes before the
+      // first probe batch below, whose keys and output stay in the GPU memory space.
+      bool const managed = keeps_hash_state_in_managed_memory();
+      std::optional<memory::scoped_managed_hash_join_allocation> managed_allocation;
+      if (managed) { managed_allocation.emplace(); }
+      auto const build_start = std::chrono::steady_clock::now();
       auto build_keys_result =
         prepare_join_keys(build_batch_ro, right_key_col_indices, _hash_key_types, stream);
       cudf::table_view build_keys = build_keys_result.keys;
@@ -1956,6 +2005,25 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
         }
         stream.sync();  // Ensure the hash table is fully built before we allow any probe
                         // batches to proceed.
+        if (managed) {
+          managed_allocation.reset();
+          auto const build_ms =
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
+                                                      build_start)
+              .count();
+          flowcsd::add_count(flowcsd::event_counter::managed_hash_joins, 1);
+          std::string placement;
+          enum_to_string(memory::managed_hash_state()->placement(), placement);
+          SIRIUS_LOG_INFO(
+            "[flowcsd] hash join id {} ({}) built its hash table in managed memory ({}): build {} "
+            "rows, {} bytes, {:.1f} ms",
+            this->get_operator_id(),
+            duckdb::JoinTypeToString(join_type),
+            placement,
+            get_cudf_table_view(build_batch_ro).num_rows(),
+            build_batch_ro.get_data()->get_size_in_bytes(),
+            build_ms);
+        }
         slot.build_state.store(BUILD_HASH_TABLE_STATE::BUILT, std::memory_order_release);
       }
     }

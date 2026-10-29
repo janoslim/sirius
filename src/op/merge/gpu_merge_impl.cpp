@@ -35,7 +35,8 @@ std::shared_ptr<cucascade::data_batch> gpu_merge_impl::concat(
   const std::vector<cucascade::read_only_data_batch>& input,
   ::cuda::stream_ref stream,
   cucascade::memory::memory_space& memory_space,
-  const telemetry::batch_telemetry_info& telemetry_info)
+  const telemetry::batch_telemetry_info& telemetry_info,
+  std::optional<rmm::device_async_resource_ref> output_resource)
 {
   // Sanity check.
   if (input.size() < 2) {
@@ -48,8 +49,8 @@ std::shared_ptr<cucascade::data_batch> gpu_merge_impl::concat(
   for (const auto& batch : input) {
     input_cudf_table_views.push_back(get_cudf_table_view(batch));
   }
-  auto output_cudf_table =
-    cudf::concatenate(input_cudf_table_views, stream, memory_space.get_default_allocator());
+  auto output_cudf_table = cudf::concatenate(
+    input_cudf_table_views, stream, output_resource.value_or(memory_space.get_default_allocator()));
 
   // Create output data batch.
   return make_data_batch(std::move(output_cudf_table), memory_space, stream, telemetry_info);

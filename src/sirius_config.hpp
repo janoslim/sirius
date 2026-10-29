@@ -27,10 +27,12 @@
 #include <cucascade/memory/topology_discovery.hpp>
 
 #include <cmath>
+#include <cstdint>
 #include <filesystem>
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 
 namespace YAML {
 class Node;
@@ -306,6 +308,52 @@ struct compression_config {
   std::string input_plan_dir{};
 };
 
+/// Where the pages of a large hash join's managed hash-table state live: FlowCSD fork, setting (라),
+/// `sirius.memory.gpu.managed_hash_join_placement` (memory/managed_hash_join_memory.hpp).
+enum class managed_hash_join_placement : std::uint8_t {
+  /// No hints: the driver moves a page to the GPU when the GPU touches it and evicts managed pages to
+  /// host memory when the GPU has no room, as with `sirius.memory.gpu.managed_memory`.
+  migrate_on_access,
+  /// cudaMallocManaged chunks with cudaMemAdvise preferred location = host memory and accessed by =
+  /// the GPU, suballocated by an RMM pool: the pages stay in host memory and the GPU maps them.
+  host_resident,
+};
+
+/// Parse a @ref managed_hash_join_placement from its YAML spelling.
+inline bool string_to_enum(std::string_view sv, managed_hash_join_placement& out)
+{
+  if (sv == "migrate_on_access") {
+    out = managed_hash_join_placement::migrate_on_access;
+    return true;
+  }
+  if (sv == "host_resident") {
+    out = managed_hash_join_placement::host_resident;
+    return true;
+  }
+  return false;
+}
+
+/// Render a @ref managed_hash_join_placement as its YAML spelling.
+inline bool enum_to_string(managed_hash_join_placement placement, std::string& out)
+{
+  switch (placement) {
+    case managed_hash_join_placement::migrate_on_access: out = "migrate_on_access"; return true;
+    case managed_hash_join_placement::host_resident: out = "host_resident"; return true;
+  }
+  return false;
+}
+
+/// FlowCSD fork, setting (라): a hash join that Sirius would partition because its build side
+/// exceeds `operator_params::max_build_hash_table_bytes`, and that one hash table can serve, runs
+/// unpartitioned with only its hash-table state in CUDA managed memory
+/// (memory/managed_hash_join_memory.hpp). Off, Sirius behaves as without the option.
+struct managed_hash_join_config {
+  /// `sirius.memory.gpu.large_hash_join_in_managed_memory`
+  bool enabled = false;
+  /// `sirius.memory.gpu.managed_hash_join_placement`
+  managed_hash_join_placement placement = managed_hash_join_placement::migrate_on_access;
+};
+
 class configuration_input_error : public std::runtime_error {
  public:
   using std::runtime_error::runtime_error;
@@ -387,6 +435,13 @@ struct sirius_config {
     return _flowcsd_config;
   }
 
+  /// FlowCSD fork, setting (라): the `large_hash_join_in_managed_memory` and
+  /// `managed_hash_join_placement` keys of the @c sirius.memory.gpu YAML block.
+  [[nodiscard]] const managed_hash_join_config& get_managed_hash_join_config() const noexcept
+  {
+    return _managed_hash_join_config;
+  }
+
   /// How many GPUs to allocate per query. 0 = use all active GPUs (default).
   /// Limits each query to the first @c gpus_per_query entries of the sorted
   /// active-GPU list; the rest are left available for future concurrent queries.
@@ -426,6 +481,7 @@ struct sirius_config {
   telemetry_config _telemetry_config;
   compression_config _compression_config;
   flowcsd::flowcsd_config _flowcsd_config;
+  managed_hash_join_config _managed_hash_join_config;
 };
 
 /// Validated configuration intent. Construction and parsing never discover hardware.

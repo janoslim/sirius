@@ -17,6 +17,8 @@
 
 #pragma once
 
+#include "sirius_config.hpp"
+
 #include <cuda/memory_resource>
 
 #include <cucascade/memory/memory_reservation_manager.hpp>
@@ -28,8 +30,18 @@ namespace memory {
 
 class sirius_memory_reservation_manager : public cucascade::memory::memory_reservation_manager {
  public:
+  /**
+   * @brief Create the memory spaces and make each GPU memory space's allocator cuDF's current
+   * device resource.
+   *
+   * @param managed_hash_join Setting (라) of the FlowCSD fork: when enabled (one GPU), creates the
+   * managed hash-state pool and registers managed_hash_join_router in front of the GPU memory
+   * space's allocator instead (memory/managed_hash_join_memory.hpp).
+   * @throws std::runtime_error without a GPU memory space, or with the option on and several.
+   */
   explicit sirius_memory_reservation_manager(
-    const std::vector<cucascade::memory::memory_space_config>& configs);
+    const std::vector<cucascade::memory::memory_space_config>& configs,
+    managed_hash_join_config const& managed_hash_join = {});
 
   ~sirius_memory_reservation_manager();
 

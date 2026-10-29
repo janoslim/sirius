@@ -19,6 +19,7 @@
 #include "config.hpp"
 #include "cucascade/utils/overloaded.hpp"
 #include "log/logging.hpp"
+#include "memory/managed_hash_join_memory.hpp"
 #include "pipeline/batch_lock_utils.hpp"
 #include "pipeline/sirius_meta_pipeline.hpp"
 #include "pipeline/sirius_pipeline.hpp"
@@ -73,6 +74,20 @@ std::vector<::cucascade::read_only_data_batch> pipelineable_operator_data::get_r
     }
   }
   return ro_batches;
+}
+
+std::size_t pipelineable_operator_data::get_estimated_size_in_bytes() const
+{
+  std::size_t total = 0;
+  auto ro_batches   = get_read_only_batches();
+  for (auto const& ro : ro_batches) {
+    if (!ro.get_data()) { continue; }
+    // Setting (라): a managed batch (the build of a hash join with its hash-table state in managed
+    // memory) needs no reservation in the GPU memory space; it would also skew the task's history.
+    if (memory::is_managed_hash_state(ro.get_data())) { continue; }
+    total = memory::saturating_add(total, ro.get_data()->get_uncompressed_data_size_in_bytes());
+  }
+  return total;
 }
 
 void pipelineable_operator_data::prepare_for_processing(

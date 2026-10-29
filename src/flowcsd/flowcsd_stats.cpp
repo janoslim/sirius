@@ -61,7 +61,9 @@ constexpr std::array<char const*, num_byte_counters> byte_names = {"chunk_bytes_
                                                                    "metadata_read",
                                                                    "host_spill_write",
                                                                    "spill_unread",
-                                                                   "spill_live_peak"};
+                                                                   "spill_live_peak",
+                                                                   "managed_build_copy",
+                                                                   "managed_hash_state_peak"};
 constexpr std::array<char const*, num_event_counters> event_names = {"row_groups_total",
                                                                      "row_groups_read",
                                                                      "pages_total",
@@ -69,7 +71,8 @@ constexpr std::array<char const*, num_event_counters> event_names = {"row_groups
                                                                      "io_requests",
                                                                      "spilled_batches",
                                                                      "restored_batches",
-                                                                     "hash_partitions"};
+                                                                     "hash_partitions",
+                                                                     "managed_hash_joins"};
 // Trace / NVTX names of the sub-intervals, in trace_category order.
 constexpr std::array<char const*, num_trace_categories> trace_names = {"meta.pread",
                                                                        "io.slab_wait",

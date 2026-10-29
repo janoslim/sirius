@@ -913,7 +913,7 @@ void SiriusContext::initialize(const sirius::parsed_sirius_config& config)
   }
 
   memory_manager_ = std::make_unique<sirius::memory::sirius_memory_reservation_manager>(
-    config_.get_memory_space_configs());
+    config_.get_memory_space_configs(), config_.get_managed_hash_join_config());
 
   // Session cache for pinned GPU-resident cuVS ANN indexes. Takes the memory
   // manager so an index build can reserve its GPU footprint through Sirius.

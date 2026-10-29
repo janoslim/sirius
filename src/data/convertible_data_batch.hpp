@@ -32,6 +32,7 @@
 #include <cucascade/memory/memory_reservation.hpp>
 #include <cucascade/memory/memory_reservation_manager.hpp>
 #include <cucascade/memory/memory_space.hpp>
+#include <memory/managed_hash_join_memory.hpp>
 #include <memory/sirius_memory_reservation_manager.hpp>
 
 #include <cstddef>
@@ -346,10 +347,12 @@ class convertible_data_batch_provider : public convertible_data_provider {
 
     auto ro = batch->try_to_read_only();
     if (!ro) { return nullptr; }
+    // Setting (라): a managed batch (hash-table state of a large hash join) is outside the GPU
+    // memory space's accounting; moving it would free no device memory, so it is never downgraded.
+    if (memory::is_managed_hash_state(ro->get_data())) { return nullptr; }
     if (ro->get_memory_space() == space) {
       return std::make_unique<convertible_data_batch>(std::move(batch));
     }
-
     return nullptr;
   }
 

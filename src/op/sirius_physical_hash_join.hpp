@@ -131,6 +131,13 @@ struct build_probe_decision {
 /// query spread across GPUs; a single STANDARD partition is unpinned, and multiple partitions
 /// use `round_robin` over `active_gpu_ids`. An empty
 /// `active_gpu_ids` yields unpinned placements.
+///
+/// FlowCSD fork, setting (라): with `large_hash_join_in_managed_memory`, a build-side decision whose
+/// join one hash table can serve (BUILD_PROBE-eligible apart from its size) but whose per-GPU build
+/// reaches `max_build_hash_table_bytes` runs BUILD_PROBE in one non-broadcast partition with
+/// `managed_hash_state` set, provided `build_rows` fits one cuDF table; a MARK join over the budget,
+/// already forced into BUILD_PROBE, gets `managed_hash_state` the same way. The option requires a
+/// single GPU (configuration check), so the managed join's one partition is the whole build.
 [[nodiscard]] partition_strategy compute_hash_join_partition_strategy(
   uint64_t total_bytes,
   bool is_build_side,
@@ -142,7 +149,9 @@ struct build_probe_decision {
   uint64_t max_broadcast_join_size,
   duckdb::JoinType join_type,
   HASH_JOIN_MODE join_mode,
-  double estimated_probe_to_build_ratio);
+  double estimated_probe_to_build_ratio,
+  bool large_hash_join_in_managed_memory = false,
+  uint64_t build_rows                    = 0);
 
 /// Which broadcast slots to discard. In a broadcast join the build table is replicated to every
 /// slot but the probe side is unpartitioned, so a slot may hold build data yet never receive probe
@@ -377,6 +386,19 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
     return _max_build_hash_table_bytes;
   }
 
+  /// @brief FlowCSD fork, setting (라): whether this join's type and mode allow it to run
+  /// unpartitioned with its hash-table state in managed memory once its build turns out too large
+  /// (option on; not right-family, full outer or mixed). The build-side PARTITION uses this before
+  /// the strategy is known, to move late build batches into managed memory as they arrive.
+  [[nodiscard]] bool may_keep_hash_state_in_managed_memory() const noexcept;
+
+  /// @brief FlowCSD fork, setting (라): true once get_partition_strategy chose to run this join
+  /// unpartitioned with its hash-table state in managed memory.
+  [[nodiscard]] bool keeps_hash_state_in_managed_memory() const noexcept
+  {
+    return _managed_hash_state.load(std::memory_order_acquire);
+  }
+
   // Publication may claim only a delivery known to contain the whole build.
   void set_build_arrives_whole(bool arrives_whole);
 
@@ -462,6 +484,11 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   // Broadcast (small build table) BUILD_PROBE join: the build side is replicated to every slot and
   // the probe side is streamed unpartitioned.
   bool _broadcast = false;
+
+  // Setting (라): the join runs unpartitioned with its hash-table state in managed memory (see
+  // get_partition_strategy). Atomic: execute(), the build-side PARTITION and the build-side CONCAT
+  // read it without op_state_mutex.
+  std::atomic<bool> _managed_hash_state{false};
 
   bool _build_arrives_whole = false;
 

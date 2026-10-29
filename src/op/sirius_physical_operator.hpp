@@ -322,16 +322,10 @@ class pipelineable_operator_data : public operator_data {
   void prepare_for_processing(const ::cucascade::memory::memory_space* requested_memory_space,
                               ::cuda::stream_ref stream) override;
 
-  [[nodiscard]] std::size_t get_estimated_size_in_bytes() const override
-  {
-    std::size_t total = 0;
-    auto ro_batches   = get_read_only_batches();
-    for (auto const& ro : ro_batches) {
-      if (!ro.get_data()) { continue; }
-      total = memory::saturating_add(total, ro.get_data()->get_uncompressed_data_size_in_bytes());
-    }
-    return total;
-  }
+  /// Sum of the batches' uncompressed sizes. Leaves out batches in managed memory (the hash-table
+  /// state of setting (라), memory/managed_hash_join_memory.hpp), which the GPU memory space's
+  /// reservations do not cover.
+  [[nodiscard]] std::size_t get_estimated_size_in_bytes() const override;
 
   [[nodiscard]] std::string get_origin_tiers() const override
   {
@@ -827,9 +821,11 @@ class sirius_physical_operator {
    * @brief Observes a batch pushed into port @p port_id, inside the pushing task, before the batch
    * becomes poppable.
    *
-   * An override must not wait for a batch lock or access device data. `sirius_physical_partition`
-   * uses the hook to certify dynamic-filter input. An engine-invariant failure may throw before the
-   * batch is added. The default does nothing.
+   * An override must not wait for a batch lock or access device data, except to replace the data of
+   * the fresh batch itself (`sirius_physical_partition` moves late build batches of setting (라)
+   * into managed memory). `sirius_physical_partition` uses the hook to certify dynamic-filter
+   * input. An engine-invariant failure may throw before the batch is added. The default does
+   * nothing.
    */
   virtual void on_input_batch_pushed(std::string_view port_id, ::cucascade::data_batch& batch);
 

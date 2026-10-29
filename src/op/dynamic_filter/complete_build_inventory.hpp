@@ -75,13 +75,16 @@ class complete_build_inventory final {
   /**
    * @brief Sorts @p batches and builds the inventory.
    *
-   * @return nullopt for fewer than two partitions, no batches, duplicate IDs, or a row total that
-   * overflows
+   * @param single_partition_accumulation The build accumulates although it has one partition
+   * (build_arrival_ledger::certification)
+   * @return nullopt for fewer than two partitions (unless @p single_partition_accumulation), no
+   * batches, duplicate IDs, or a row total that overflows
    */
   [[nodiscard]] static std::optional<complete_build_inventory> try_create(
     std::vector<batch_entry> batches,
     std::vector<std::optional<cudf::data_type>> schema,
-    std::size_t partition_count);
+    std::size_t partition_count,
+    bool single_partition_accumulation);
 
   complete_build_inventory(std::vector<batch_entry> batches,
                            std::vector<std::optional<cudf::data_type>> schema,
@@ -114,6 +117,10 @@ class build_arrival_ledger final {
   struct certification {
     std::size_t repository_batches;  ///< Batches currently queued in the input repository
     std::size_t partition_count;     ///< Physical partitions of the build PARTITION
+    /// The build accumulates its filter although it has one partition: a hash join that keeps its
+    /// hash-table state in managed memory (FlowCSD fork, setting (라)) replaces a partitioned join
+    /// and accumulates like it. A one-partition build otherwise publishes from the whole build.
+    bool single_partition_accumulation = false;
   };
 
   /**

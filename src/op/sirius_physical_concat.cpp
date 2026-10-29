@@ -17,13 +17,26 @@
 #include "op/sirius_physical_concat.hpp"
 
 #include "data/data_batch_utils.hpp"
+#include "flowcsd/flowcsd_stats.hpp"
+#include "memory/managed_hash_join_memory.hpp"
 #include "op/merge/gpu_merge_impl.hpp"
 #include "op/sirius_physical_hash_join.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 #include "telemetry/nvtx.hpp"
 
+#include <rmm/resource_ref.hpp>
+
 namespace sirius {
 namespace op {
+
+namespace {
+
+/// Device bytes charged to a managed build's fold task without history: the fold's output goes to
+/// managed memory, and cudf::concatenate's device views and offsets of the inputs' columns stay far
+/// below this.
+constexpr std::size_t MANAGED_BUILD_FOLD_DEVICE_BYTES = 1ULL << 20;  // 1 MiB
+
+}  // namespace
 
 sirius_physical_concat::sirius_physical_concat(duckdb::vector<sirius::logical_type> types,
                                                std::size_t estimated_cardinality,
@@ -197,7 +210,12 @@ std::unique_ptr<operator_data> sirius_physical_concat::execute(const operator_da
 
   std::vector<std::shared_ptr<cucascade::data_batch>> output_batches;
   output_batches.reserve(1);
-  if (input_batches.size() == 1) {
+  if (builds_managed_hash_state()) {
+    // Setting (라): the folded build table of a managed join is always in managed memory, so none
+    // of the join's hash-table state is in the GPU memory space.
+    output_batches.push_back(
+      fold_build_into_managed_memory(input_batches, *partitioned_input_data, *space, stream));
+  } else if (input_batches.size() == 1) {
     // Forward the owned input batch (idle at park); no read lock carried.
     output_batches.push_back(partitioned_input_data->get_data_batches()[0]);
   } else {
@@ -259,8 +277,38 @@ void sirius_physical_concat::set_concat_all(bool concat_all)
 std::size_t sirius_physical_concat::no_history_peak_memory_estimate(
   const op::input_stats& stats) const
 {
+  // A managed build's fold allocates its output in managed memory; the GPU memory space holds only
+  // cudf::concatenate's column views and offsets. A positive estimate keeps the task from falling
+  // back to twice its input bytes (gpu_pipeline_task::get_estimated_reservation_size_info).
+  if (builds_managed_hash_state()) { return MANAGED_BUILD_FOLD_DEVICE_BYTES; }
   if (stats.num_batches <= 1) { return 0; }
   return stats.bytes;
+}
+
+bool sirius_physical_concat::builds_managed_hash_state() const
+{
+  auto const* join = dynamic_cast<sirius_physical_hash_join const*>(_downstream_join);
+  return _is_build && join != nullptr && join->keeps_hash_state_in_managed_memory();
+}
+
+std::shared_ptr<cucascade::data_batch> sirius_physical_concat::fold_build_into_managed_memory(
+  std::vector<cucascade::read_only_data_batch> const& batches,
+  partitioned_operator_data const& input,
+  cucascade::memory::memory_space& space,
+  ::cuda::stream_ref stream) const
+{
+  if (batches.size() > 1) {
+    auto* pool = memory::managed_hash_state();
+    return gpu_merge_impl::concat(batches, stream, space, batch_telemetry(), pool->resource_ref());
+  }
+  // A build that arrived in managed memory (the PARTITION's late batches) is forwarded as is.
+  if (memory::is_managed_hash_state(batches[0].get_data())) { return input.get_data_batches()[0]; }
+  // A build small enough to stay in device memory on arrival is copied once here.
+  auto managed       = memory::copy_to_managed_hash_state(get_cudf_table_view(batches[0]), stream);
+  auto const bytes   = managed->alloc_size();
+  auto managed_batch = make_data_batch(std::move(managed), space, stream, batch_telemetry());
+  flowcsd::add_bytes(flowcsd::byte_counter::managed_build_copy, bytes);
+  return managed_batch;
 }
 
 }  // namespace op

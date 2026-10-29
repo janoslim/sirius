@@ -69,17 +69,14 @@ inline gds_read_pools& process_gds_read_pools()
 }  // namespace managed_gpu_memory_detail
 
 /**
- * @brief GPU memory space allocator for `sirius.memory.gpu.managed_memory: true`.
+ * @brief The default managed memory pool of @p device_id (cudaMallocFromPoolAsync on
+ * `cudaMemGetDefaultMemPool(..., cudaMemAllocationTypeManaged)`), with freed memory kept in the pool.
  *
- * Allocates CUDA managed memory from @p device_id's default managed pool
- * (`rmm::mr::cuda_async_managed_memory_resource`, i.e. cudaMallocFromPoolAsync), and creates the
- * device's plain device memory pool for GPUDirect Storage read buffers.  @p capacity is unused:
- * managed memory needs no pool sized up front, and the GPU memory space's reservation adaptor
- * enforces the configured capacity.  Matches cucascade::memory::DeviceMemoryResourceFactoryFn
- * (spelled `::cuda` because Sirius has its own sirius::cuda namespace).
+ * Shared by `sirius.memory.gpu.managed_memory` (the whole GPU memory space) and
+ * `sirius.memory.gpu.large_hash_join_in_managed_memory` (memory/managed_hash_join_memory.hpp), so
+ * both settings use the same managed memory.
  */
-inline ::cuda::mr::any_resource<::cuda::mr::device_accessible> make_managed_gpu_memory_resource(
-  int device_id, [[maybe_unused]] std::size_t capacity)
+inline rmm::mr::cuda_async_managed_memory_resource make_default_managed_pool(int device_id)
 {
   rmm::cuda_set_device_raii set_device{rmm::cuda_device_id{device_id}};
   rmm::mr::cuda_async_managed_memory_resource managed_pool;
@@ -90,6 +87,24 @@ inline ::cuda::mr::any_resource<::cuda::mr::device_accessible> make_managed_gpu_
   std::uint64_t keep_freed_bytes = std::numeric_limits<std::uint64_t>::max();
   RMM_CUDA_TRY(cudaMemPoolSetAttribute(
     managed_pool.pool_handle(), cudaMemPoolAttrReleaseThreshold, &keep_freed_bytes));
+  return managed_pool;
+}
+
+/**
+ * @brief GPU memory space allocator for `sirius.memory.gpu.managed_memory: true`.
+ *
+ * Allocates CUDA managed memory from @p device_id's default managed pool
+ * (make_default_managed_pool), and creates the device's plain device memory pool for GPUDirect
+ * Storage read buffers.  @p capacity is unused: managed memory needs no pool sized up front, and the
+ * GPU memory space's reservation adaptor enforces the configured capacity.  Matches
+ * cucascade::memory::DeviceMemoryResourceFactoryFn (spelled `::cuda` because Sirius has its own
+ * sirius::cuda namespace).
+ */
+inline ::cuda::mr::any_resource<::cuda::mr::device_accessible> make_managed_gpu_memory_resource(
+  int device_id, [[maybe_unused]] std::size_t capacity)
+{
+  rmm::cuda_set_device_raii set_device{rmm::cuda_device_id{device_id}};
+  auto managed_pool = make_default_managed_pool(device_id);
 
   // The read-buffer pool is a default rmm::mr::cuda_async_memory_resource on this device: a
   // private device memory pool that grows on demand and keeps freed memory.

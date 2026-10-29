@@ -25,6 +25,8 @@
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/memory/memory_space.hpp>
 
+#include <rmm/resource_ref.hpp>
+
 #include <memory>
 #include <optional>
 #include <vector>
@@ -55,7 +57,11 @@ class gpu_merge_impl {
    *
    * @param input The input batches to be concatenated.
    * @param stream CUDA stream used for device memory operations and kernel launches.
-   * @param memory_space The memory space used to allocate memory for the output data batch.
+   * @param memory_space The memory space the output data batch belongs to; its allocator holds the
+   * output unless @p output_resource is given.
+   * @param output_resource Resource for the output table instead of the memory space's allocator:
+   * the managed hash-state pool for the build of a hash join that keeps its hash-table state in
+   * managed memory (FlowCSD fork, setting (라)).
    *
    * @return The output data batch.
    */
@@ -63,7 +69,8 @@ class gpu_merge_impl {
     const std::vector<cucascade::read_only_data_batch>& input,
     ::cuda::stream_ref stream,
     cucascade::memory::memory_space& memory_space,
-    const telemetry::batch_telemetry_info& telemetry_info = {});
+    const telemetry::batch_telemetry_info& telemetry_info         = {},
+    std::optional<rmm::device_async_resource_ref> output_resource = std::nullopt);
 
   /**
    * @brief Perform ungrouped merge aggregate on multiple data batches.

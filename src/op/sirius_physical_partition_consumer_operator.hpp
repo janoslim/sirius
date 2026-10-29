@@ -52,18 +52,22 @@ struct partition_sizing_input {
 /// applied to the partition operator(s); `broadcast`/`build_probe` are reported back so the
 /// partition can configure its own wiring (e.g. enabling build-side concat_all). `placement` says
 /// which GPU each partition runs on; the partition hands it to every operator that emits this
-/// exchange's partitioned data.
+/// exchange's partitioned data. `managed_hash_state` marks a hash join that runs unpartitioned
+/// with its hash-table state in CUDA managed memory (FlowCSD fork, setting (라);
+/// memory/managed_hash_join_memory.hpp).
 struct partition_strategy {
   /// @throws std::invalid_argument if `num_partitions < 1` or the placement covers a different
   ///         number of partitions.
   partition_strategy(int num_partitions_p,
                      bool broadcast_p,
                      bool build_probe_p,
-                     partition_placement placement_p)
+                     partition_placement placement_p,
+                     bool managed_hash_state_p = false)
     : num_partitions(num_partitions_p),
       broadcast(broadcast_p),
       build_probe(build_probe_p),
-      placement(std::move(placement_p))
+      placement(std::move(placement_p)),
+      managed_hash_state(managed_hash_state_p)
   {
     if (num_partitions < 1) {
       throw std::invalid_argument("partition_strategy: num_partitions (" +
@@ -80,6 +84,7 @@ struct partition_strategy {
   bool broadcast;
   bool build_probe;
   partition_placement placement;
+  bool managed_hash_state;
 };
 
 /// Multi-GPU partition floor derived purely from the GPU count: below the small-table threshold a

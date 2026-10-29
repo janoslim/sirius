@@ -36,6 +36,7 @@
 #include <cucascade/memory/memory_reservation.hpp>
 #include <cucascade/memory/memory_reservation_manager.hpp>
 #include <cucascade/memory/memory_space.hpp>
+#include <memory/managed_hash_join_memory.hpp>
 #include <memory/sirius_memory_reservation_manager.hpp>
 
 #include <cstddef>
@@ -142,9 +143,11 @@ class convertible_gpu_pipeline_task : public convertible_data {
     for (const auto& batch : batches) {
       if (!batch) { continue; }
 
-      // Quick check: skip batches already at a target space (avoid unnecessary locking)
+      // Quick check: skip batches already at a target space (avoid unnecessary locking), and
+      // managed batches (setting (라)), which are never downgraded (convertible_data_batch_provider).
       {
-        auto ro           = batch->to_read_only();
+        auto ro = batch->to_read_only();
+        if (memory::is_managed_hash_state(ro.get_data())) { continue; }
         auto* batch_space = ro.get_memory_space();
         bool at_target    = false;
         for (const auto* ts : target_spaces) {
@@ -188,6 +191,8 @@ class convertible_gpu_pipeline_task : public convertible_data {
 
     std::size_t total = 0;
     for (const auto& ro : operator_data->get_read_only_batches()) {
+      // A managed batch (setting (라)) is not converted, so it frees nothing in the space.
+      if (memory::is_managed_hash_state(ro.get_data())) { continue; }
       if (ro.get_memory_space() == space) { total += ro.get_data()->get_size_in_bytes(); }
     }
     return total;
@@ -337,6 +342,8 @@ class convertible_gpu_pipeline_task_provider : public convertible_data_provider 
       if (batch->get_state() != cucascade::batch_state::idle) { continue; }
       auto ro = batch->try_to_read_only();
       if (!ro) { continue; }
+      // A managed batch (setting (라)) is never downgraded, so it does not make the task a candidate.
+      if (memory::is_managed_hash_state(ro->get_data())) { continue; }
       if (ro->get_memory_space() == space) { return true; }
     }
 

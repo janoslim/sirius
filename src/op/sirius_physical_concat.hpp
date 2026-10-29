@@ -82,6 +82,28 @@ class sirius_physical_concat : public sirius_physical_partition_consumer_operato
     const op::input_stats& stats) const override;
 
  private:
+  /// Setting (라): this is the build-side CONCAT of a hash join that keeps its hash-table state in
+  /// managed memory (sirius_physical_hash_join::keeps_hash_state_in_managed_memory).
+  [[nodiscard]] bool builds_managed_hash_state() const;
+
+  /**
+   * @brief Setting (라): fold a managed join's build into one batch held in managed memory.
+   *
+   * Several batches are concatenated straight into the managed hash-state pool; a lone batch that
+   * is already managed is forwarded, and a lone device-memory batch is copied (counted in the
+   * query's `managed_build_copy` bytes).
+   *
+   * @param batches The task's locked input batches
+   * @param input The task's input, whose idle batch handle is forwarded
+   * @param space The GPU memory space the folded batch belongs to
+   * @param stream The task's stream
+   */
+  [[nodiscard]] std::shared_ptr<cucascade::data_batch> fold_build_into_managed_memory(
+    std::vector<cucascade::read_only_data_batch> const& batches,
+    partitioned_operator_data const& input,
+    cucascade::memory::memory_space& space,
+    ::cuda::stream_ref stream) const;
+
   /**
    * @brief Plans the next batch group for one partition without removing data
    *
