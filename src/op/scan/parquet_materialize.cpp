@@ -20,6 +20,7 @@
 #include "flowcsd/flowcsd_stats.hpp"
 #include "io/io_context.hpp"
 #include "io/types.hpp"
+#include "memory/managed_gpu_memory.hpp"
 #include "op/scan/page_survival.hpp"
 #include "telemetry/nvtx.hpp"
 
@@ -360,10 +361,13 @@ fetched_chunks fetch_chunks(parquet_source const& src,
       *located.chunk, located.num_rows, static_cast<std::uint64_t>(located.size), pages, pages);
   }
 
+  // cuFile cannot DMA into CUDA managed memory: with sirius.memory.gpu.managed_memory the chunks
+  // land in a plain device memory pool, otherwise in the GPU memory space (@p mr) as before.
+  auto const read_buffer_mr = sirius::memory::gds_read_buffer_resource(mr);
   fetched_chunks out;
   out.buffers.reserve(ranges.size());
   for (auto const& range : ranges) {
-    out.buffers.emplace_back(static_cast<std::size_t>(range.size()), stream, mr);
+    out.buffers.emplace_back(static_cast<std::size_t>(range.size()), stream, read_buffer_mr);
   }
 
   std::vector<io::slice> reads;
@@ -785,11 +789,13 @@ fetched_chunks allocate_chunk_buffers(std::span<located_chunk const> chunks,
                                       ::cuda::stream_ref stream,
                                       rmm::device_async_resource_ref mr)
 {
+  // Device memory for the same reason as in fetch_chunks: the datasource reads into these buffers.
+  auto const read_buffer_mr = sirius::memory::gds_read_buffer_resource(mr);
   fetched_chunks out;
   out.buffers.reserve(chunks.size());
   out.spans.reserve(chunks.size());
   for (auto const& chunk : chunks) {
-    auto const& buffer = out.buffers.emplace_back(chunk.size, stream, mr);
+    auto const& buffer = out.buffers.emplace_back(chunk.size, stream, read_buffer_mr);
     out.spans.emplace_back(static_cast<std::uint8_t const*>(buffer.data()), buffer.size());
   }
   return out;

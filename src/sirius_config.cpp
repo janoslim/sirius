@@ -18,6 +18,7 @@
 
 #include "exec/config.hpp"
 #include "log/logging.hpp"
+#include "memory/managed_gpu_memory.hpp"
 #include "yaml_reader.hpp"
 
 #include <cuda_runtime_api.h>
@@ -517,6 +518,9 @@ struct gpu_mem_config {
   std::variant<double, std::uint64_t> reservation_limit{1.0};
   double downgrade_trigger_fraction{0.8};
   double downgrade_stop_fraction{0.6};
+  // FlowCSD fork: allocate the GPU memory space from CUDA managed memory, so usage_limit_bytes may
+  // exceed the GPU and the driver pages data to host memory (memory/managed_gpu_memory.hpp).
+  bool managed_memory{false};
 
   static void from_yaml(const YAML::Node& node, gpu_mem_config& opt)
   {
@@ -541,6 +545,7 @@ struct gpu_mem_config {
     r.optional(
       "downgrade_trigger_fraction", opt.downgrade_trigger_fraction, yaml::fraction<double>{});
     r.optional("downgrade_stop_fraction", opt.downgrade_stop_fraction, yaml::fraction<double>{});
+    r.optional("managed_memory", opt.managed_memory);
     r.reject_unknown();
     validate_downgrade_fractions(
       "sirius.memory.gpu", opt.downgrade_trigger_fraction, opt.downgrade_stop_fraction);
@@ -565,6 +570,9 @@ struct gpu_mem_config {
       builder.set_reservation_limit_per_gpu(std::get<std::uint64_t>(reservation_limit));
     }
     builder.set_downgrade_fractions_per_gpu(downgrade_trigger_fraction, downgrade_stop_fraction);
+    if (managed_memory) {
+      builder.set_gpu_memory_resource_factory(sirius::memory::make_managed_gpu_memory_resource);
+    }
     // Keep the high-level path on Sirius's default. The low-level
     // space.gpu[] replacement surface retains the diagnostic per-stream control.
     builder.track_reservation_per_stream(false);
@@ -865,6 +873,13 @@ try {
   if (auto n = r.optional_node("flowcsd")) {
     flowcsd::flowcsd_config::from_yaml(*n, settings._flowcsd_config);
   }
+  // cuFile cannot write from or read into CUDA managed memory, and direct spill hands it GPU
+  // memory space buffers; managed memory is meant to make that spill unnecessary anyway.
+  if (gpu_cfg.managed_memory && settings._flowcsd_config.direct_disk_spill) {
+    throw std::runtime_error(
+      "sirius.memory.gpu.managed_memory and sirius.flowcsd.direct_disk_spill are mutually "
+      "exclusive");
+  }
 
   // Explicit space configs (low-level API)
   if (auto space_node = r.optional_node("space")) {
@@ -937,7 +952,11 @@ try {
     gpu_cfg.setup_configurator(builder);
     host_cfg.setup_configurator(builder);
     disk_cfg.setup_configurator(builder);
-    if (auto bytes = std::get_if<std::uint64_t>(&gpu_cfg.usage_limit)) {
+    // Managed memory may be sized past the GPU: the driver pages it between GPU and host memory.
+    // cucascade's configurator still asserts that a byte limit fits the GPU, but asserts are
+    // compiled out of the Release build, so only a Debug build cannot use such a managed limit.
+    if (auto bytes = std::get_if<std::uint64_t>(&gpu_cfg.usage_limit);
+        bytes && !gpu_cfg.managed_memory) {
       // Resolve selected devices through the same configurator before its byte-limit assertion.
       auto capacity_builder = builder;
       capacity_builder.set_usage_limit_ratio_per_gpu(1.0);
