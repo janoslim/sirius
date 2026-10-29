@@ -31,6 +31,7 @@
 #include <cstdint>
 #include <mutex>
 #include <optional>
+#include <string>
 #include <string_view>
 
 namespace duckdb {
@@ -175,21 +176,57 @@ class sirius_physical_partition : public sirius_physical_operator {
   [[nodiscard]] sirius_physical_hash_join* accumulated_filter_join() const noexcept;
 
   /**
-   * @brief Setting (라): move @p batch into managed memory once the build arrived so far, @p batch
-   * included, exceeds `max_build_hash_table_bytes`.
+   * @brief Setting (라): move @p batch into host-resident managed memory when
+   * late_build_batch_goes_to_managed_memory says so.
    *
    * The build arriving through the FULL input waits whole before the join chooses its strategy, so
    * a build too large for one device-memory hash table would fill the GPU memory space first. The
    * first batches up to `max_build_hash_table_bytes` stay in device memory (a build that small
-   * still runs as before); every GPU batch from the one that would cross it is copied into managed
-   * memory and its device copy freed before the batch becomes poppable, counted in the query's
-   * `managed_build_copy` bytes.
+   * still runs as before); later GPU batches are copied into managed memory and their device copies
+   * freed before the batches become poppable, counted in the query's `managed_build_copy` bytes.
+   *
+   * The copies are host-resident whatever `managed_hash_join_placement` says: the build-side
+   * CONCAT reads each of them once, in order, to fold the build table, which follows the placement.
    *
    * @param join The downstream join, which may keep its hash-table state in managed memory
    * @param batch The arriving batch; its representation is replaced in place
    */
   void keep_late_build_batch_in_managed_memory(sirius_physical_hash_join const& join,
                                                cucascade::data_batch& batch);
+
+  /**
+   * @brief Setting (라): count an arriving build batch and decide whether it moves into managed
+   * memory.
+   *
+   * Nothing moves while the arrived build is within `max_build_hash_table_bytes`. At the batch
+   * that passes it, choose_late_build_moves decides from the projected build rows whether batches
+   * move at all. They then move until the arrived rows exceed one cuDF table (`cudf::size_type`):
+   * the strategy partitions such a join, so moving more would only cost copies. The batches moved
+   * by then stay in managed memory. The stop is logged at INFO.
+   *
+   * @param join The downstream join
+   * @param rows Rows of the batch
+   * @param bytes Bytes of the batch
+   * @param in_device_memory Whether the batch is a GPU table in device memory, the only kind that
+   * moves
+   * @return true when the batch moves into managed memory
+   */
+  [[nodiscard]] bool late_build_batch_goes_to_managed_memory(sirius_physical_hash_join const& join,
+                                                             uint64_t rows,
+                                                             uint64_t bytes,
+                                                             bool in_device_memory);
+
+  /**
+   * @brief Setting (라): when the arrived build first passes `max_build_hash_table_bytes`, decide
+   * whether build batches move into managed memory at all, and log the decision at INFO.
+   *
+   * Projects the build's total rows from this PARTITION's projected input bytes at the bytes per
+   * row arrived so far; no batch moves when that exceeds one cuDF table. The projection may be
+   * unavailable, in which case batches move.
+   *
+   * @pre `_managed_build_mutex` is held.
+   */
+  void choose_late_build_moves(sirius_physical_hash_join const& join);
 
   /**
    * @brief Decides once, before the first batch leaves the input repository, whether the join
@@ -294,14 +331,24 @@ class sirius_physical_partition : public sirius_physical_operator {
   /// session entirely without one.
   std::atomic<sirius_physical_hash_join*> _accumulating_join{nullptr};
 
-  /// Setting (라), keep_late_build_batch_in_managed_memory: serializes the two fields below, which
+  /// Setting (라): whether arriving GPU build batches move into managed memory
+  /// (late_build_batch_goes_to_managed_memory).
+  enum class late_build_moves : uint8_t {
+    not_started,  ///< the arrived build is within max_build_hash_table_bytes; nothing moves
+    moving,       ///< the build passed it: GPU batches in device memory move
+    stopped,      ///< the build cannot be one cuDF table (projected or arrived): nothing moves
+  };
+  /// Setting (라), late_build_batch_goes_to_managed_memory: serializes the fields below, which
   /// concurrent pushing tasks update.
   std::mutex _managed_build_mutex;
-  /// Bytes of the arrived build batches kept in device memory.
-  uint64_t _device_build_bytes{0};
-  /// Set once an arriving batch did not fit under `max_build_hash_table_bytes`: every later GPU
-  /// batch goes to managed memory too.
-  bool _build_overflows_to_managed_memory{false};
+  late_build_moves _late_build_moves{late_build_moves::not_started};
+  /// Rows and bytes of every arrived build batch, kept in device memory or moved.
+  uint64_t _arrived_build_rows{0};
+  uint64_t _arrived_build_bytes{0};
+  /// Bytes of the arrived build batches moved into managed memory.
+  uint64_t _moved_build_bytes{0};
+  /// The build-row projection of choose_late_build_moves, as logged; repeated in the stop line.
+  std::string _build_row_projection;
 
   /// Enabled only for grouped-aggregation partitions.
   bool _enable_size_estimation{false};

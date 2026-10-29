@@ -25,19 +25,23 @@
 // after the first `max_build_hash_table_bytes`, the concatenated build table, the build-key cast
 // columns and the cuDF hash-table objects. Every other allocation stays in the GPU memory space
 // (device memory with its reservations, accounting and downgrade), so the managed state is outside
-// that accounting and is never downgraded.
+// that accounting and is never downgraded. A build longer than one cuDF table (`cudf::size_type`
+// rows) stays partitioned, and its build-side PARTITION stops copying batches into managed memory
+// once it sees that (sirius_physical_partition).
 //
 // - managed_hash_state_pool: CUDA managed memory plus a registry of its live allocations, so that a
 //   freed pointer finds its way back and a batch can be recognized as managed without a driver call.
-//   `managed_hash_join_placement: migrate_on_access` uses the device's default managed pool (the pool
-//   that `sirius.memory.gpu.managed_memory` uses); `host_resident` uses an RMM pool over
-//   cudaMallocManaged chunks advised to stay in host memory and be mapped for the GPU over PCIe.
+//   The build batches copied on arrival always live in host-resident managed memory: an RMM pool
+//   over cudaMallocManaged chunks advised to stay in host memory and be mapped for the GPU over
+//   PCIe. The concatenated build table and the hash table follow `managed_hash_join_placement`:
+//   `migrate_on_access` uses the device's default managed pool (the pool that
+//   `sirius.memory.gpu.managed_memory` uses), `host_resident` the host-resident pool.
 // - managed_hash_join_router: cuDF's current device resource while the option is on. cuDF's hash-join
 //   objects take no memory resource (cudf::filtered_join, cudf::distinct_hash_join and the
 //   preprocessed build table of cudf::hash_join allocate from the current resource), so placing them
 //   is only possible by routing per thread: inside a scoped_managed_hash_join_allocation an
-//   allocation goes to the pool, otherwise to the GPU memory space's allocator. A deallocation goes
-//   to the pool exactly when its pointer is a live pool allocation.
+//   allocation goes to the pool's placement memory, otherwise to the GPU memory space's
+//   allocator. A deallocation goes to the pool exactly when its pointer is a live pool allocation.
 // - is_managed_hash_state(): whether a batch's table lives in the pool, so that downgrade and the
 //   task reservation estimates leave it out.
 //
@@ -158,9 +162,29 @@ class advised_managed_memory_resource {
   int _device_id;
 };
 
+/// Which managed memory of managed_hash_state_pool an allocation comes from.
+enum class managed_memory_kind : std::uint8_t {
+  /// The memory `managed_hash_join_placement` names: the folded build table, the build-key cast
+  /// columns and the cuDF hash table.
+  placement,
+  /// Host-resident managed memory whatever the placement: the build batches that the build-side
+  /// PARTITION copies on arrival, before they are folded.
+  host_resident,
+};
+
 /**
- * @brief Managed memory for the hash-table state of large hash joins, with a registry of the live
+ * @brief Managed memory for the hash-table state of large hash joins, with one registry of the live
  * allocations (see the file comment).
+ *
+ * Holds two managed memories: an RMM pool over advised_managed_memory_resource chunks
+ * (host-resident) and, with migrate_on_access placement, the device's default managed memory pool.
+ * The build batches that the build-side PARTITION copies on arrival always go to the host-resident
+ * memory: the fold reads each of them once, in order, so keeping them on the GPU gains nothing, and
+ * under migrate_on_access they filled the GPU and competed with the GPU memory space's own pool (Q3
+ * at SF=1000 then failed with an illegal memory access while partitioning them, Slurm job 1183;
+ * that this caused it is suspected, not proven). The registry covers both memories, so a freed
+ * pointer returns to the memory it came from, is_managed_hash_state() recognizes both, and the
+ * query's peak statistic counts both.
  *
  * cuDF calls that take a memory resource (cudf::concatenate, the cudf::table copy constructor)
  * allocate here through resource_ref(). Thread-safe.
@@ -168,18 +192,17 @@ class advised_managed_memory_resource {
 class managed_hash_state_pool {
  public:
   /**
-   * @brief Allocate from the default managed memory pool of @p device_id (migrate_on_access, the
-   * pool of `managed_memory`) or from an RMM pool over advised_managed_memory_resource chunks
-   * (host_resident; the pool starts empty and grows on demand).
+   * @brief Create the host-resident memory on @p device_id (an RMM pool that starts empty and grows
+   * on demand) and, for migrate_on_access, also the default managed memory pool of @p device_id
+   * (the pool of `managed_memory`). host_resident placement uses the host-resident memory for all.
    */
   managed_hash_state_pool(int device_id, managed_hash_join_placement placement)
-    : _pool{placement == managed_hash_join_placement::host_resident
-              ? ::cuda::mr::any_resource<::cuda::mr::device_accessible>{rmm::mr::pool_memory_resource{
-                  ::cuda::mr::any_resource<::cuda::mr::device_accessible>{
-                    advised_managed_memory_resource{device_id}},
-                  0}}
-              : ::cuda::mr::any_resource<::cuda::mr::device_accessible>{
-                  make_default_managed_pool(device_id)}},
+    : _host_resident{rmm::mr::pool_memory_resource{
+        any_device_resource{advised_managed_memory_resource{device_id}}, 0}},
+      _migrate_on_access{
+        placement == managed_hash_join_placement::migrate_on_access
+          ? std::optional<any_device_resource>{make_default_managed_pool(device_id)}
+          : std::nullopt},
       _device_id{device_id},
       _placement{placement}
   {
@@ -194,47 +217,32 @@ class managed_hash_state_pool {
   [[nodiscard]] managed_hash_join_placement placement() const noexcept { return _placement; }
 
   /**
-   * @brief Allocate @p bytes of managed memory ordered on @p stream and record it as live.
-   * @throws rmm::out_of_memory or rmm::bad_alloc when the pool cannot allocate.
+   * @brief Allocate @p bytes of @p kind managed memory ordered on @p stream and record it as live.
+   * @throws rmm::out_of_memory or rmm::bad_alloc when the memory cannot be allocated.
    */
-  void* allocate(::cuda::stream_ref stream,
+  void* allocate(managed_memory_kind kind,
+                 ::cuda::stream_ref stream,
                  std::size_t bytes,
                  std::size_t alignment = rmm::CUDA_ALLOCATION_ALIGNMENT)
   {
-    void* ptr = _pool.allocate(stream, bytes, alignment);
-    track_new_allocation(ptr, bytes);
+    void* ptr = memory(kind).allocate(stream, bytes, alignment);
+    track_new_allocation(ptr, bytes, kind);
     return ptr;
-  }
-
-  /// @brief Free an allocation of this pool on @p stream.
-  void deallocate(::cuda::stream_ref stream,
-                  void* ptr,
-                  std::size_t bytes,
-                  std::size_t alignment = rmm::CUDA_ALLOCATION_ALIGNMENT) noexcept
-  {
-    forget_freed_allocation(ptr);
-    _pool.deallocate(stream, ptr, bytes, alignment);
   }
 
   /// @brief Synchronous form of allocate().
-  void* allocate_sync(std::size_t bytes, std::size_t alignment = rmm::CUDA_ALLOCATION_ALIGNMENT)
+  void* allocate_sync(managed_memory_kind kind,
+                      std::size_t bytes,
+                      std::size_t alignment = rmm::CUDA_ALLOCATION_ALIGNMENT)
   {
-    void* ptr = _pool.allocate_sync(bytes, alignment);
-    track_new_allocation(ptr, bytes);
+    void* ptr = memory(kind).allocate_sync(bytes, alignment);
+    track_new_allocation(ptr, bytes, kind);
     return ptr;
   }
 
-  /// @brief Synchronous form of deallocate().
-  void deallocate_sync(void* ptr,
-                       std::size_t bytes,
-                       std::size_t alignment = rmm::CUDA_ALLOCATION_ALIGNMENT) noexcept
-  {
-    forget_freed_allocation(ptr);
-    _pool.deallocate_sync(ptr, bytes, alignment);
-  }
-
   /**
-   * @brief Free @p ptr on @p stream when it is a live allocation of this pool.
+   * @brief Free @p ptr on @p stream, into the memory it came from, when it is a live allocation of
+   * this pool.
    * @return false, having done nothing, when @p ptr is not one (it came from another resource).
    */
   bool deallocate_if_owned(::cuda::stream_ref stream,
@@ -242,20 +250,22 @@ class managed_hash_state_pool {
                            std::size_t bytes,
                            std::size_t alignment) noexcept
   {
-    if (!erase_live_allocation(ptr)) { return false; }
-    _pool.deallocate(stream, ptr, bytes, alignment);
+    auto const kind = erase_live_allocation(ptr);
+    if (!kind.has_value()) { return false; }
+    memory(*kind).deallocate(stream, ptr, bytes, alignment);
     return true;
   }
 
   /// @brief Synchronous form of deallocate_if_owned().
   bool deallocate_sync_if_owned(void* ptr, std::size_t bytes, std::size_t alignment) noexcept
   {
-    if (!erase_live_allocation(ptr)) { return false; }
-    _pool.deallocate_sync(ptr, bytes, alignment);
+    auto const kind = erase_live_allocation(ptr);
+    if (!kind.has_value()) { return false; }
+    memory(*kind).deallocate_sync(ptr, bytes, alignment);
     return true;
   }
 
-  /// @brief Whether @p address lies inside a live allocation of this pool.
+  /// @brief Whether @p address lies inside a live allocation of this pool, in either memory.
   [[nodiscard]] bool contains(void const* address) const
   {
     // Without live allocations nothing can match; the common case skips the lock.
@@ -264,65 +274,116 @@ class managed_hash_state_pool {
     std::shared_lock const lock(_mutex);
     auto const after = _live_allocations.upper_bound(position);
     if (after == _live_allocations.begin()) { return false; }
-    auto const& [start, bytes] = *std::prev(after);
-    return position < start + bytes;
+    auto const& [start, allocation] = *std::prev(after);
+    return position < start + allocation.bytes;
   }
 
-  /// @brief Copyable resource that forwards to a pool: a cuda::mr resource must be copyable, which
-  /// the pool (mutex, registry) is not.
+  /// @brief Copyable resource over one memory of a pool: a cuda::mr resource must be copyable,
+  /// which the pool (mutex, registry) is not.
   class resource_handle {
    public:
-    explicit resource_handle(managed_hash_state_pool& pool) noexcept : _pool{&pool} {}
+    resource_handle(managed_hash_state_pool& pool, managed_memory_kind kind) noexcept
+      : _pool{&pool}, _kind{kind}
+    {
+    }
 
     void* allocate(::cuda::stream_ref stream,
                    std::size_t bytes,
                    std::size_t alignment = rmm::CUDA_ALLOCATION_ALIGNMENT)
     {
-      return _pool->allocate(stream, bytes, alignment);
+      return _pool->allocate(_kind, stream, bytes, alignment);
     }
     void deallocate(::cuda::stream_ref stream,
                     void* ptr,
                     std::size_t bytes,
                     std::size_t alignment = rmm::CUDA_ALLOCATION_ALIGNMENT) noexcept
     {
-      _pool->deallocate(stream, ptr, bytes, alignment);
+      _pool->deallocate(_kind, stream, ptr, bytes, alignment);
     }
     void* allocate_sync(std::size_t bytes, std::size_t alignment = rmm::CUDA_ALLOCATION_ALIGNMENT)
     {
-      return _pool->allocate_sync(bytes, alignment);
+      return _pool->allocate_sync(_kind, bytes, alignment);
     }
     void deallocate_sync(void* ptr,
                          std::size_t bytes,
                          std::size_t alignment = rmm::CUDA_ALLOCATION_ALIGNMENT) noexcept
     {
-      _pool->deallocate_sync(ptr, bytes, alignment);
+      _pool->deallocate_sync(_kind, ptr, bytes, alignment);
     }
     friend bool operator==(resource_handle const& lhs, resource_handle const& rhs) noexcept
     {
-      return lhs._pool == rhs._pool;
+      return lhs._pool == rhs._pool && lhs._kind == rhs._kind;
     }
     friend void get_property(resource_handle const&, ::cuda::mr::device_accessible) noexcept {}
 
    private:
     managed_hash_state_pool* _pool;
+    managed_memory_kind _kind;
   };
 
-  /// @brief Memory resource reference to this pool, valid as long as the pool (the process).
-  [[nodiscard]] rmm::device_async_resource_ref resource_ref() noexcept
+  /// @brief Memory resource reference to the @p kind memory of this pool, valid as long as the pool
+  /// (the process).
+  [[nodiscard]] rmm::device_async_resource_ref resource_ref(managed_memory_kind kind) noexcept
   {
-    return rmm::device_async_resource_ref{_handle};
+    if (kind == managed_memory_kind::host_resident) {
+      return rmm::device_async_resource_ref{_host_resident_handle};
+    }
+    return rmm::device_async_resource_ref{_placement_handle};
   }
 
  private:
+  /// Spelled `::cuda` because Sirius has its own sirius::cuda namespace.
+  using any_device_resource = ::cuda::mr::any_resource<::cuda::mr::device_accessible>;
+
+  /// A live allocation: its size and the memory it came from.
+  struct live_allocation {
+    std::size_t bytes;
+    managed_memory_kind kind;
+  };
+
+  /// @brief The memory that @p kind allocations come from.
+  [[nodiscard]] any_device_resource& memory(managed_memory_kind kind) noexcept
+  {
+    // With host_resident placement the placement memory is the host-resident memory.
+    if (kind == managed_memory_kind::placement && _migrate_on_access.has_value()) {
+      return *_migrate_on_access;
+    }
+    return _host_resident;
+  }
+
+  /// @brief Free @p ptr, which a handle over the @p kind memory gives back, on @p stream.
+  void deallocate(managed_memory_kind kind,
+                  ::cuda::stream_ref stream,
+                  void* ptr,
+                  std::size_t bytes,
+                  std::size_t alignment) noexcept
+  {
+    if (deallocate_if_owned(stream, ptr, bytes, alignment)) { return; }
+    report_untracked_free(ptr);
+    memory(kind).deallocate(stream, ptr, bytes, alignment);
+  }
+
+  /// @brief Synchronous form of deallocate().
+  void deallocate_sync(managed_memory_kind kind,
+                       void* ptr,
+                       std::size_t bytes,
+                       std::size_t alignment) noexcept
+  {
+    if (deallocate_sync_if_owned(ptr, bytes, alignment)) { return; }
+    report_untracked_free(ptr);
+    memory(kind).deallocate_sync(ptr, bytes, alignment);
+  }
+
   /// @brief Record a new allocation as live and raise the query's peak statistic.
-  void track_new_allocation(void* ptr, std::size_t bytes)
+  void track_new_allocation(void* ptr, std::size_t bytes, managed_memory_kind kind)
   {
     // A zero-byte request returns no memory: nothing to track.
     if (ptr == nullptr) { return; }
     std::size_t live_bytes = 0;
     {
       std::unique_lock const lock(_mutex);
-      _live_allocations.insert_or_assign(reinterpret_cast<std::uintptr_t>(ptr), bytes);
+      _live_allocations.insert_or_assign(reinterpret_cast<std::uintptr_t>(ptr),
+                                         live_allocation{bytes, kind});
       _live_bytes += bytes;
       live_bytes = _live_bytes;
       _live_count.store(_live_allocations.size(), std::memory_order_release);
@@ -330,44 +391,51 @@ class managed_hash_state_pool {
     flowcsd::max_bytes(flowcsd::byte_counter::managed_hash_state_peak, live_bytes);
   }
 
-  /// @brief Remove @p ptr from the live allocations. @return false when it is not one.
-  bool erase_live_allocation(void* ptr) noexcept
+  /// @brief Remove @p ptr from the live allocations.
+  /// @return The memory it came from, or no value when it is not a live allocation.
+  std::optional<managed_memory_kind> erase_live_allocation(void* ptr) noexcept
   {
-    if (ptr == nullptr || _live_count.load(std::memory_order_acquire) == 0) { return false; }
+    if (ptr == nullptr || _live_count.load(std::memory_order_acquire) == 0) { return std::nullopt; }
     auto const position = reinterpret_cast<std::uintptr_t>(ptr);
     {
       // Most frees routed through managed_hash_join_router are not managed: look up shared first.
       std::shared_lock const lookup(_mutex);
-      if (!_live_allocations.contains(position)) { return false; }
+      if (!_live_allocations.contains(position)) { return std::nullopt; }
     }
     std::unique_lock const lock(_mutex);
     auto const found = _live_allocations.find(position);
-    if (found == _live_allocations.end()) { return false; }
-    _live_bytes -= found->second;
+    if (found == _live_allocations.end()) { return std::nullopt; }
+    auto const kind = found->second.kind;
+    _live_bytes -= found->second.bytes;
     _live_allocations.erase(found);
     _live_count.store(_live_allocations.size(), std::memory_order_release);
-    return true;
+    return kind;
   }
 
-  /// @brief Remove a pointer freed directly through this pool from the live allocations.
-  void forget_freed_allocation(void* ptr) noexcept
+  /// @brief Report a pointer freed through a handle that is not a live allocation.
+  static void report_untracked_free(void* ptr) noexcept
   {
-    if (ptr == nullptr || erase_live_allocation(ptr)) { return; }
-    // Every non-null pointer of this pool is registered at allocation, so this is a bookkeeping bug;
-    // the memory is still returned to the pool.
+    // Every non-null pointer of this pool is registered at allocation, so this is a bookkeeping
+    // bug; the caller still returns the memory to the handle's memory.
+    if (ptr == nullptr) { return; }
     SIRIUS_LOG_ERROR("[managed_hash_state_pool] freed {} which is not a live managed allocation",
                      ptr);
   }
 
-  /// The managed memory this pool hands out (constructor).
-  ::cuda::mr::any_resource<::cuda::mr::device_accessible> _pool;
+  /// Host-resident managed memory (constructor): the PARTITION's build copies, and with
+  /// host_resident placement everything.
+  any_device_resource _host_resident;
+  /// The device's default managed memory pool with migrate_on_access placement; empty otherwise.
+  std::optional<any_device_resource> _migrate_on_access;
   int _device_id;
   managed_hash_join_placement _placement;
   mutable std::shared_mutex _mutex;
-  std::map<std::uintptr_t, std::size_t> _live_allocations;  ///< start -> bytes; guarded by _mutex
-  std::size_t _live_bytes{0};                               ///< guarded by _mutex
+  std::map<std::uintptr_t, live_allocation> _live_allocations;  ///< by start; guarded by _mutex
+  std::size_t _live_bytes{0};               ///< both memories; guarded by _mutex
   std::atomic<std::size_t> _live_count{0};  ///< _live_allocations.size(), read without the lock
-  resource_handle _handle{*this};           ///< what resource_ref() refers to
+  /// What resource_ref() refers to.
+  resource_handle _placement_handle{*this, managed_memory_kind::placement};
+  resource_handle _host_resident_handle{*this, managed_memory_kind::host_resident};
 };
 
 namespace managed_hash_join_detail {
@@ -411,7 +479,7 @@ inline managed_hash_state_pool& install_managed_hash_state_pool(int device_id,
 
 /**
  * @brief While alive, the calling thread's allocations through cuDF's current device resource go to
- * the managed hash-state pool (managed_hash_join_router). Nests.
+ * the placement memory of the managed hash-state pool (managed_hash_join_router). Nests.
  */
 class scoped_managed_hash_join_allocation {
  public:
@@ -427,9 +495,10 @@ class scoped_managed_hash_join_allocation {
 
 /**
  * @brief cuDF's current device resource while the option is on: the calling thread's allocations go
- * to the managed hash-state pool inside a scoped_managed_hash_join_allocation and to the GPU memory
- * space's allocator otherwise; a deallocation goes to the pool when its pointer is a live pool
- * allocation and to the GPU memory space's allocator otherwise.
+ * to the placement memory of the managed hash-state pool inside a
+ * scoped_managed_hash_join_allocation and to the GPU memory space's allocator otherwise; a
+ * deallocation goes to the pool when its pointer is a live pool allocation and to the GPU memory
+ * space's allocator otherwise.
  *
  * Copyable view: both targets outlive it (the GPU memory space owns its allocator, and the pool is
  * never destroyed).
@@ -447,7 +516,7 @@ class managed_hash_join_router {
                  std::size_t alignment = rmm::CUDA_ALLOCATION_ALIGNMENT)
   {
     if (managed_hash_join_detail::open_allocation_scopes > 0) {
-      return _managed_pool->allocate(stream, bytes, alignment);
+      return _managed_pool->allocate(managed_memory_kind::placement, stream, bytes, alignment);
     }
     return _space_allocator.allocate(stream, bytes, alignment);
   }
@@ -464,7 +533,7 @@ class managed_hash_join_router {
   void* allocate_sync(std::size_t bytes, std::size_t alignment = rmm::CUDA_ALLOCATION_ALIGNMENT)
   {
     if (managed_hash_join_detail::open_allocation_scopes > 0) {
-      return _managed_pool->allocate_sync(bytes, alignment);
+      return _managed_pool->allocate_sync(managed_memory_kind::placement, bytes, alignment);
     }
     return _space_allocator.allocate_sync(bytes, alignment);
   }
@@ -493,18 +562,19 @@ class managed_hash_join_router {
 };
 
 /**
- * @brief Deep copy of @p view into the managed hash-state pool, ordered on @p stream.
+ * @brief Deep copy of @p view into the @p kind memory of the managed hash-state pool, ordered on
+ * @p stream.
  * @throws std::logic_error when the option is off.
  */
 [[nodiscard]] inline std::unique_ptr<cudf::table> copy_to_managed_hash_state(
-  cudf::table_view const& view, ::cuda::stream_ref stream)
+  cudf::table_view const& view, managed_memory_kind kind, ::cuda::stream_ref stream)
 {
   auto* pool = managed_hash_state();
   if (pool == nullptr) {
     throw std::logic_error(
       "copy_to_managed_hash_state: sirius.memory.gpu.large_hash_join_in_managed_memory is off");
   }
-  return std::make_unique<cudf::table>(view, stream, pool->resource_ref());
+  return std::make_unique<cudf::table>(view, stream, pool->resource_ref(kind));
 }
 
 namespace managed_hash_join_detail {
@@ -523,7 +593,7 @@ inline void const* first_buffer_address(cudf::column_view const& column)
 }  // namespace managed_hash_join_detail
 
 /**
- * @brief Whether @p data is a GPU table held in the managed hash-state pool.
+ * @brief Whether @p data is a GPU table held in the managed hash-state pool (either memory).
  *
  * A managed table is allocated as a whole in the pool (copy_to_managed_hash_state or a concatenation
  * into the pool), so its first buffer decides. Always false while the option is off; a registry

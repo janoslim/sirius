@@ -89,9 +89,10 @@ class sirius_physical_concat : public sirius_physical_partition_consumer_operato
   /**
    * @brief Setting (라): fold a managed join's build into one batch held in managed memory.
    *
-   * Several batches are concatenated straight into the managed hash-state pool; a lone batch that
-   * is already managed is forwarded, and a lone device-memory batch is copied (counted in the
-   * query's `managed_build_copy` bytes).
+   * The folded build table follows `managed_hash_join_placement`: several batches are concatenated
+   * straight into the pool's placement memory, and a lone batch is copied there (counted in the
+   * query's `managed_build_copy` bytes) unless it is the PARTITION's host-resident copy and the
+   * placement is host_resident, in which case it is forwarded.
    *
    * @param batches The task's locked input batches
    * @param input The task's input, whose idle batch handle is forwarded

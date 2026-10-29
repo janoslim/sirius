@@ -297,14 +297,25 @@ std::shared_ptr<cucascade::data_batch> sirius_physical_concat::fold_build_into_m
   cucascade::memory::memory_space& space,
   ::cuda::stream_ref stream) const
 {
+  auto* pool = memory::managed_hash_state();
   if (batches.size() > 1) {
-    auto* pool = memory::managed_hash_state();
-    return gpu_merge_impl::concat(batches, stream, space, batch_telemetry(), pool->resource_ref());
+    return gpu_merge_impl::concat(batches,
+                                  stream,
+                                  space,
+                                  batch_telemetry(),
+                                  pool->resource_ref(memory::managed_memory_kind::placement));
   }
-  // A build that arrived in managed memory (the PARTITION's late batches) is forwarded as is.
-  if (memory::is_managed_hash_state(batches[0].get_data())) { return input.get_data_batches()[0]; }
-  // A build small enough to stay in device memory on arrival is copied once here.
-  auto managed       = memory::copy_to_managed_hash_state(get_cudf_table_view(batches[0]), stream);
+  // A lone batch already in managed memory is the PARTITION's host-resident copy; with
+  // host_resident placement that is where the folded build table belongs, so it is forwarded as is.
+  if (memory::is_managed_hash_state(batches[0].get_data()) &&
+      pool->placement() == managed_hash_join_placement::host_resident) {
+    return input.get_data_batches()[0];
+  }
+  // Otherwise the lone batch is copied once into the placement memory: from device memory (a build
+  // small enough to stay there on arrival) or, under migrate_on_access, from the PARTITION's
+  // host-resident copy.
+  auto managed = memory::copy_to_managed_hash_state(
+    get_cudf_table_view(batches[0]), memory::managed_memory_kind::placement, stream);
   auto const bytes   = managed->alloc_size();
   auto managed_batch = make_data_batch(std::move(managed), space, stream, batch_telemetry());
   flowcsd::add_bytes(flowcsd::byte_counter::managed_build_copy, bytes);

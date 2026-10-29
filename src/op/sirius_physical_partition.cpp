@@ -34,13 +34,18 @@
 #include "sirius_context.hpp"
 #include "telemetry/nvtx.hpp"
 
+#include <cudf/types.hpp>
+
 #include <rmm/cuda_device.hpp>
 #include <rmm/detail/error.hpp>
 
 #include <algorithm>
 #include <cmath>
+#include <format>
+#include <limits>
 #include <mutex>
 #include <optional>
+#include <string>
 #include <string_view>
 
 namespace sirius {
@@ -58,6 +63,12 @@ constexpr bool producer_requires_full_partition_input(SiriusPhysicalOperatorType
     default: return false;
   }
 }
+
+/// Rows of one cuDF table (`cudf::size_type`). A hash join whose build is longer cannot fold the
+/// build into one batch, so Sirius partitions it (compute_hash_join_partition_strategy) and it
+/// cannot keep its hash-table state in managed memory (setting (라)).
+constexpr uint64_t MAX_CUDF_TABLE_ROWS =
+  static_cast<uint64_t>(std::numeric_limits<cudf::size_type>::max());
 
 }  // namespace
 
@@ -804,21 +815,15 @@ void sirius_physical_partition::keep_late_build_batch_in_managed_memory(
 {
   auto mutable_batch = batch.to_mutable();
   auto* data         = mutable_batch.get_data();
-  // Only a GPU table can be copied; a batch already in managed memory (pushed twice) stays.
-  auto* gpu = dynamic_cast<cucascade::gpu_table_representation*>(data);
-  if (gpu == nullptr || memory::is_managed_hash_state(data)) { return; }
-
-  // Keep the first max_build_hash_table_bytes of the build in device memory, so a build that
-  // turns out small enough runs exactly as without the option.
-  auto const bytes = data->get_size_in_bytes();
-  {
-    std::lock_guard const lock(_managed_build_mutex);
-    if (!_build_overflows_to_managed_memory &&
-        _device_build_bytes + bytes <= join.max_build_hash_table_bytes()) {
-      _device_build_bytes += bytes;
-      return;
-    }
-    _build_overflows_to_managed_memory = true;
+  if (data == nullptr) { return; }
+  // Every arrival counts toward the build's rows and bytes, but only a GPU table in device memory
+  // can move; a batch already in managed memory (pushed twice) stays.
+  auto* gpu                   = dynamic_cast<cucascade::gpu_table_representation*>(data);
+  bool const in_device_memory = gpu != nullptr && !memory::is_managed_hash_state(data);
+  auto const rows             = representation_num_rows(data).value_or(0);
+  if (!late_build_batch_goes_to_managed_memory(
+        join, rows, data->get_size_in_bytes(), in_device_memory)) {
+    return;
   }
 
   // Copy on a stream of the batch's GPU memory space, after the batch's producer finished writing.
@@ -829,12 +834,90 @@ void sirius_physical_partition::keep_late_build_batch_in_managed_memory(
     RMM_CUDA_TRY(cudaStreamWaitEvent(stream.get(), writer, 0));
   }
   auto managed = std::make_unique<cucascade::gpu_table_representation>(
-    memory::copy_to_managed_hash_state(gpu->get_table_view(), stream), *space, stream);
+    memory::copy_to_managed_hash_state(
+      gpu->get_table_view(), memory::managed_memory_kind::host_resident, stream),
+    *space,
+    stream);
   auto const managed_bytes = managed->get_size_in_bytes();
   // set_data frees the device copy, which the copy must have finished reading.
   stream.sync();
   mutable_batch.set_data(std::move(managed));
   flowcsd::add_bytes(flowcsd::byte_counter::managed_build_copy, managed_bytes);
+}
+
+bool sirius_physical_partition::late_build_batch_goes_to_managed_memory(
+  sirius_physical_hash_join const& join, uint64_t rows, uint64_t bytes, bool in_device_memory)
+{
+  std::lock_guard const guard(_managed_build_mutex);
+  _arrived_build_rows += rows;
+  _arrived_build_bytes += bytes;
+  if (_late_build_moves == late_build_moves::stopped) { return false; }
+  if (_late_build_moves == late_build_moves::not_started) {
+    // Keep the first max_build_hash_table_bytes of the build in device memory, so a build that
+    // turns out small enough runs exactly as without the option.
+    if (_arrived_build_bytes <= join.max_build_hash_table_bytes()) { return false; }
+    choose_late_build_moves(join);
+    if (_late_build_moves == late_build_moves::stopped) { return false; }
+  }
+  // Over one cuDF table the strategy partitions the join: later batches stay in device memory as
+  // for any partitioned build, and the batches moved so far stay where they are.
+  if (_arrived_build_rows > MAX_CUDF_TABLE_ROWS) {
+    _late_build_moves = late_build_moves::stopped;
+    SIRIUS_LOG_INFO(
+      "[flowcsd] partition id {} stops moving build batches into managed memory: {} rows, {} bytes "
+      "arrived, over one cuDF table ({} rows); the {} bytes moved stay in managed memory ({})",
+      this->get_operator_id(),
+      _arrived_build_rows,
+      _arrived_build_bytes,
+      MAX_CUDF_TABLE_ROWS,
+      _moved_build_bytes,
+      _build_row_projection);
+    return false;
+  }
+  if (!in_device_memory) { return false; }
+  _moved_build_bytes += bytes;
+  return true;
+}
+
+void sirius_physical_partition::choose_late_build_moves(sirius_physical_hash_join const& join)
+{
+  // The planner's row estimate cannot decide: DuckDB put the 3.2-billion-row Q3 build at SF=1000 at
+  // 400 million rows (Slurm job 1183). Instead project this PARTITION's input bytes with the
+  // estimator behind estimated_total_input_bytes(), which only aggregate partitions enable, and
+  // convert them at the bytes per row arrived so far.
+  auto const estimate = pipeline::estimate_port_total_input_bytes(*this, "default");
+  double const bytes_per_row =
+    _arrived_build_rows == 0
+      ? 0.0
+      : static_cast<double>(_arrived_build_bytes) / static_cast<double>(_arrived_build_rows);
+  std::optional<uint64_t> projected_rows;
+  _build_row_projection = "no input projection";
+  if (estimate.has_value() && _arrived_build_rows > 0) {
+    // An estimate cannot invalidate bytes already received.
+    uint64_t const projected_bytes =
+      std::max(static_cast<uint64_t>(estimate->bytes), _arrived_build_bytes);
+    projected_rows = scale_rows(_arrived_build_rows, projected_bytes, _arrived_build_bytes);
+    _build_row_projection =
+      std::format("input projected at {} bytes (exact={}, hops={}, samples={}) = {} rows",
+                  projected_bytes,
+                  estimate->exact,
+                  estimate->hops,
+                  estimate->ratio_samples,
+                  *projected_rows);
+  }
+  bool const too_long = projected_rows.has_value() && *projected_rows > MAX_CUDF_TABLE_ROWS;
+  _late_build_moves   = too_long ? late_build_moves::stopped : late_build_moves::moving;
+  SIRIUS_LOG_INFO(
+    "[flowcsd] partition id {} build passed max_build_hash_table_bytes {} at {} rows, {} bytes "
+    "({:.2f} bytes/row); {}; {}",
+    this->get_operator_id(),
+    join.max_build_hash_table_bytes(),
+    _arrived_build_rows,
+    _arrived_build_bytes,
+    bytes_per_row,
+    _build_row_projection,
+    too_long ? "no build batch moves into managed memory: the projected rows exceed one cuDF table"
+             : "build batches from this one on move into host-resident managed memory");
 }
 
 sirius_physical_hash_join* sirius_physical_partition::accumulated_filter_join() const noexcept
