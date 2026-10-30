@@ -18,6 +18,7 @@
 
 #include "data/chunked_spill_copy.hpp"
 #include "log/logging.hpp"
+#include "telemetry/nvtx.hpp"
 
 #include <cudf/column/column_view.hpp>
 #include <cudf/null_mask.hpp>
@@ -42,12 +43,16 @@
 
 #include <cassert>
 #include <cstdint>
+#include <optional>
 #include <vector>
 
 namespace sirius {
 namespace spill {
 
 namespace {
+
+/// Set by host_spill_scope; read by convert_gpu_to_host_chunked on the same thread.
+thread_local bool host_spill_in_progress = false;
 
 // Layout planning is a faithful transcription of the cucascade fast converter's planning pass
 // (cucascade/src/cudf/representation_converter_builtins.cpp, convert_gpu_to_host_fast). Keeping
@@ -254,6 +259,11 @@ void submit_chunk(std::span<const copy_op> ops,
  * submits copies every ~chunk_bytes instead of hoarding every op for one monolithic batched
  * call, so the DMA engine drains chunk k while the column-tree walk collects chunk k+1. The
  * final synchronize preserves the converter contract: source buffers are dead after return.
+ *
+ * Inside a host_spill_scope (a downgrade into the HOST tier) the phases carry the SSD spill
+ * path's NVTX names: planning the layout and allocating pinned blocks is gsb::spill::pack (as the
+ * layout/region step of convert_gpu_to_tutti_spill), launching and waiting for the D2H copies is
+ * gsb::spill::write. Other GPU->HOST copies (results, pinned tables) stay unmarked.
  */
 std::unique_ptr<cucascade::idata_representation> convert_gpu_to_host_chunked(
   cucascade::idata_representation& source,
@@ -268,6 +278,8 @@ std::unique_ptr<cucascade::idata_representation> convert_gpu_to_host_chunked(
   const cudf::table_view view = gpu_source.get_table_view();
 
   // Pass 1: plan the allocation layout.
+  std::optional<nvtx_scoped_range> pack_range;
+  if (host_spill_in_progress) { pack_range.emplace("gsb::spill::pack"); }
   std::size_t current_offset = 0;
   std::vector<cucascade::memory::column_metadata> columns;
   columns.reserve(static_cast<std::size_t>(view.num_columns()));
@@ -284,8 +296,11 @@ std::unique_ptr<cucascade::idata_representation> convert_gpu_to_host_chunked(
   absl::Cleanup sync_on_failure = [&]() noexcept {
     if (copies_pending) { CUCASCADE_ASSERT_CUDA_SUCCESS(cudaStreamSynchronize(stream.get())); }
   };
+  pack_range.reset();
 
   // Pass 3: collect D2H ops, flushing every ~chunk_bytes as the tree is walked.
+  std::optional<nvtx_scoped_range> write_range;
+  if (host_spill_in_progress) { write_range.emplace("gsb::spill::write"); }
   std::vector<void*> dsts;
   std::vector<const void*> srcs;
   std::vector<std::size_t> sizes;
@@ -300,6 +315,7 @@ std::unique_ptr<cucascade::idata_representation> convert_gpu_to_host_chunked(
   batcher.flush_pending();
   stream.sync();
   copies_pending = false;
+  write_range.reset();
 
   auto host_alloc = cucascade::memory::host_table_allocation::create(
     std::move(allocation), std::move(columns), total_size);
@@ -309,6 +325,10 @@ std::unique_ptr<cucascade::idata_representation> convert_gpu_to_host_chunked(
 }
 
 }  // namespace
+
+host_spill_scope::host_spill_scope() noexcept { host_spill_in_progress = true; }
+
+host_spill_scope::~host_spill_scope() { host_spill_in_progress = false; }
 
 void register_chunked_spill_converters(cucascade::representation_converter_registry& registry,
                                        std::size_t chunk_bytes)

@@ -44,5 +44,21 @@ namespace spill {
 void register_chunked_spill_converters(cucascade::representation_converter_registry& registry,
                                        std::size_t chunk_bytes);
 
+/**
+ * @brief Marks the calling thread as moving a downgrade-selected batch into the HOST tier.
+ *
+ * While a scope is alive, the chunked GPU->HOST converter labels its phases with the
+ * gsb::spill::pack / gsb::spill::write NVTX ranges that profiles attribute to spilling. The same
+ * converter also copies query results and pinned tables to the host; those calls open no scope
+ * and stay unmarked. Only the downgrade dispatch (convertible_data_batch, HOST target) opens one.
+ */
+class host_spill_scope {
+ public:
+  host_spill_scope() noexcept;
+  ~host_spill_scope();
+  host_spill_scope(host_spill_scope const&)            = delete;
+  host_spill_scope& operator=(host_spill_scope const&) = delete;
+};
+
 }  // namespace spill
 }  // namespace sirius

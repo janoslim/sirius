@@ -42,8 +42,8 @@ namespace sirius::flowcsd {
 
 /// Latency-breakdown categories, highest attribution priority first.
 enum class time_category : std::uint8_t {
-  spill_write,     ///< GPU -> NVMe spill of a batch (staging copies + Tutti writes)
-  spill_read,      ///< NVMe -> GPU restore of a spilled batch
+  spill_write,     ///< spill of a batch: GPU -> NVMe (staging copies + Tutti writes) or GPU -> HOST tier
+  spill_read,      ///< restore of a spilled batch to the GPU, from NVMe or from the HOST tier
   nvme_read,       ///< Parquet chunk/page reads (Tutti submit -> completion + staging copy)
   decode,          ///< cuDF decompression + decode of the read pages
   hash_partition,  ///< PARTITION operator (hash scatter of build/probe batches)

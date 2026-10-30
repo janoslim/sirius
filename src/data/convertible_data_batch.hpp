@@ -18,7 +18,10 @@
 
 #include "data/convertible_data.hpp"
 #include "data/sirius_converter_registry.hpp"
+#include "data/spill_chunked_converters.hpp"
+#include "flowcsd/flowcsd_stats.hpp"
 #include "log/logging.hpp"
+#include "telemetry/nvtx.hpp"
 
 #include <cuda/stream>
 
@@ -141,10 +144,18 @@ class convertible_data_batch : public convertible_data {
           mut.convert_to<cucascade::gpu_table_representation>(
             converter_registry, *reservation, stream);
           break;
-        case cucascade::memory::Tier::HOST:
+        case cucascade::memory::Tier::HOST: {
+          // The downgrade chose the HOST tier: this is a spill. control covers the whole move
+          // (incl. freeing the GPU copy); the chunked converter marks its pack and write phases
+          // inside it, the same purpose names as the SSD spill path. The FlowCSD spill_write
+          // timer covers the same move, as it covers convert_gpu_to_tutti_spill for DISK.
+          nvtx_scoped_range const control_range{"gsb::spill::control"};
+          flowcsd::timed_scope const spill_timer{flowcsd::time_category::spill_write};
+          spill::host_spill_scope const host_spill;
           mut.convert_to<cucascade::host_data_representation>(
             converter_registry, *reservation, stream);
           break;
+        }
         case cucascade::memory::Tier::DISK:
           mut.convert_to<cucascade::disk_data_representation>(
             converter_registry, *reservation, stream);

@@ -16,7 +16,9 @@
 
 #pragma once
 
+#include "flowcsd/flowcsd_stats.hpp"
 #include "log/logging.hpp"
+#include "telemetry/nvtx.hpp"
 
 #include <cuda/stream>
 
@@ -175,6 +177,17 @@ inline std::optional<lock_and_prepare_batch_result> lock_and_prepare_batch(
             .ro_lock   = clone->to_read_only(),
           };
           // mut_accessor to the original batch dropped.
+        }
+        // A HOST-tier batch here was spilled by the downgrade (scans upload their own host data
+        // elsewhere), so its restore is a spill read. cuCascade's HOST->GPU converter copies and
+        // rebuilds the columns in one call, so the whole call is gsb::spill::read and the FlowCSD
+        // spill_read time (as convert_tutti_spill_to_gpu for DISK). DISK sources are left to the
+        // Tutti converter, which marks and times its own phases.
+        std::optional<nvtx_scoped_range> read_range;
+        std::optional<flowcsd::timed_scope> spill_timer;
+        if (mut_accessor.get_current_tier() == cucascade::memory::Tier::HOST) {
+          read_range.emplace("gsb::spill::read");
+          spill_timer.emplace(flowcsd::time_category::spill_read);
         }
         mut_accessor.convert_to<cucascade::gpu_table_representation>(
           registry, target_space, stream);
