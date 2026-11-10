@@ -320,7 +320,6 @@ Runtime::Runtime(Options const& options) : impl_(std::make_unique<Impl>())
       auto make_output = [&](HostBuffer& host, std::uint64_t bytes, xrt::kernel const& drain) {
         host.data = static_cast<std::uint8_t*>(std::aligned_alloc(FILE_ALIGNMENT, bytes));
         if (host.data == nullptr) { fail("aligned_alloc of output memory"); }
-        std::memset(host.data, 0, bytes);
         if (options.register_host_memory) { options.register_host_memory(host.data, bytes); }
         return xrt::bo(card.device, host.data, bytes, xrt::bo::flags::normal, drain.group_id(DRAIN_OUTPUT));
       };
