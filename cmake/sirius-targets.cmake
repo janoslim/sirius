@@ -63,7 +63,8 @@ set(SIRIUS_LINK_LIBRARIES
     ${SIRIUS_CURL_TARGET}
     OpenSSL::Crypto
     absl::any_invocable
-    kvikio::kvikio)
+    kvikio::kvikio
+    ${FLOWCSD_XRT_COREUTIL})
 if(BUILD_WITH_CTRACK)
   list(APPEND SIRIUS_LINK_LIBRARIES $<BUILD_INTERFACE:ctrack::ctrack>)
 endif()
@@ -169,7 +170,7 @@ set_target_properties(
              EXPORT_NAME sirius
              VERSION "${PROJECT_VERSION}"
              SOVERSION 0
-             INSTALL_RPATH "$ORIGIN"
+             INSTALL_RPATH "$ORIGIN;${FLOWCSD_XRT_DIR}/lib"
              INSTALL_REMOVE_ENVIRONMENT_RPATH ON)
 target_compile_features(sirius_shared INTERFACE cxx_std_23)
 # Installed static consumers use the public headers too. Keep this requirement

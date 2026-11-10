@@ -76,5 +76,6 @@ target_sources(
           sirius_physical_ungrouped_aggregate.cpp
           sirius_physical_union.cpp
           partition/crc32_partition_hash.cu
+          scan/csd_fpga_assemble.cu
           scan/equality_delete_mask.cu
           scan/page_survival.cu)

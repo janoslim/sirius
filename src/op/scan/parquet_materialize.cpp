@@ -16,14 +16,17 @@
 
 #include "op/scan/parquet_materialize.hpp"
 
+#include "flowcsd/csd_fpga_runtime.hpp"
 #include "flowcsd/flowcsd_config.hpp"
 #include "flowcsd/flowcsd_stats.hpp"
 #include "io/io_context.hpp"
 #include "io/types.hpp"
 #include "memory/managed_gpu_memory.hpp"
+#include "op/scan/csd_fpga_assemble.hpp"
 #include "op/scan/page_survival.hpp"
 #include "telemetry/nvtx.hpp"
 
+#include <cudf/column/column_factories.hpp>
 #include <cudf/io/datasource.hpp>
 #include <cudf/io/experimental/hybrid_scan_multifile.hpp>
 #include <cudf/strings/strings_column_view.hpp>
@@ -33,13 +36,23 @@
 
 #include <rmm/device_buffer.hpp>
 
+#include <cuda_runtime.h>
+
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
+#include <cstdlib>
+#include <exception>
 #include <filesystem>
+#include <fstream>
 #include <iterator>
+#include <limits>
+#include <mutex>
 #include <optional>
+#include <sstream>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <tuple>
 #include <unordered_map>
 #include <utility>
@@ -1154,6 +1167,430 @@ std::unique_ptr<cudf::table> materialize_parquet(
     return materialize_bulk(sources, options, ranges, stream, mr);
   }
   return materialize_general(sources, options, stream, mr);
+}
+
+// ---- Key Idea 1: Parquet scans on the eight SmartSSD FPGAs -------------------------------------
+
+namespace {
+
+namespace csd = flowcsd::csd;
+
+constexpr std::size_t CSD_MAX_FILE_WORKERS = 16;  // concurrent file scans of one split (8 cards x 2)
+
+/// One scan of the CSD catalog (board/csd_scan_catalog.txt).
+struct csd_catalog_scan {
+  std::string query, table, name;
+  std::vector<std::string> projected;
+  std::vector<std::pair<std::string, std::vector<csd::Interval>>> predicates;
+};
+
+[[noreturn]] void csd_fail(std::string const& message)
+{
+  throw std::runtime_error("[materialize_csd_fpga] " + message);
+}
+
+std::string required_env(char const* name)
+{
+  char const* value = std::getenv(name);
+  if (value == nullptr || *value == '\0') { csd_fail(std::string(name) + " is not set"); }
+  return value;
+}
+
+std::vector<csd_catalog_scan> const& csd_catalog()
+{
+  static std::vector<csd_catalog_scan> const catalog = [] {
+    auto const path = required_env("FLOWCSD_CSD_CATALOG");
+    std::ifstream in(path);
+    if (!in) { csd_fail("cannot open " + path); }
+    std::vector<csd_catalog_scan> scans;
+    std::string line;
+    while (std::getline(in, line)) {
+      std::istringstream fields(line);
+      std::string keyword;
+      if (!(fields >> keyword) || keyword[0] == '#' || keyword == "end") { continue; }
+      if (keyword == "scan") {
+        csd_catalog_scan scan;
+        std::size_t count = 0;
+        fields >> scan.query >> scan.table >> scan.name >> count;
+        scan.projected.resize(count);
+        for (auto& column : scan.projected) { fields >> column; }
+        scans.push_back(std::move(scan));
+      } else if (keyword == "pred" && !scans.empty()) {
+        std::string column;
+        std::size_t count = 0;
+        fields >> column >> count;
+        std::vector<csd::Interval> intervals(count);
+        for (auto& iv : intervals) { fields >> iv.low >> iv.high; }
+        scans.back().predicates.emplace_back(column, std::move(intervals));
+      } else {
+        csd_fail("malformed catalog line: " + line);
+      }
+      if (fields.fail()) { csd_fail("malformed catalog line: " + line); }
+    }
+    return scans;
+  }();
+  return catalog;
+}
+
+/// $FLOWCSD_QUERY as q01..q22.
+std::string current_flowcsd_query()
+{
+  auto query = required_env("FLOWCSD_QUERY");
+  if (query.size() == 2 && query[0] == 'q') { query = "q0" + query.substr(1); }
+  return query;
+}
+
+/// The catalog predicates of this query's scan of @p table. Scans of one table in one query share their predicates
+/// except Q22 customer, told apart by their projected columns; anything else ambiguous stops the query.
+std::vector<std::pair<std::string, std::vector<csd::Interval>>> const& csd_predicates(
+  std::string const& table, std::vector<std::string> const& unique_columns)
+{
+  auto const query = current_flowcsd_query();
+  std::vector<csd_catalog_scan const*> candidates;
+  for (auto const& scan : csd_catalog()) {
+    if (scan.query == query && scan.table == table) { candidates.push_back(&scan); }
+  }
+  if (candidates.empty()) { csd_fail("no catalog scan of " + table + " in " + query); }
+  auto const same_predicates = [&](csd_catalog_scan const* scan) {
+    auto const& a = scan->predicates;
+    auto const& b = candidates.front()->predicates;
+    return a.size() == b.size() &&
+           std::equal(a.begin(), a.end(), b.begin(), [](auto const& x, auto const& y) {
+             return x.first == y.first && x.second.size() == y.second.size() &&
+                    std::equal(x.second.begin(), x.second.end(), y.second.begin(),
+                               [](auto const& i, auto const& j) { return i.low == j.low && i.high == j.high; });
+           });
+  };
+  if (std::all_of(candidates.begin(), candidates.end(), same_predicates)) {
+    return candidates.front()->predicates;
+  }
+  for (auto const* scan : candidates) {
+    auto projected = scan->projected;
+    auto wanted    = unique_columns;
+    std::sort(projected.begin(), projected.end());
+    std::sort(wanted.begin(), wanted.end());
+    if (projected == wanted) { return scan->predicates; }
+  }
+  csd_fail("scans of " + table + " in " + query + " differ in predicates and none projects exactly the scan's columns");
+}
+
+cudf::data_type csd_cudf_type(FileMetaData const& footer, std::string const& name)
+{
+  for (auto const& elem : footer.schema) {
+    if (elem.name != name) { continue; }
+    bool const is_decimal =
+      (elem.converted_type.has_value() && *elem.converted_type == cudf::io::parquet::ConvertedType::DECIMAL) ||
+      (elem.logical_type.has_value() && elem.logical_type->type == cudf::io::parquet::LogicalType::DECIMAL);
+    if (is_decimal) { return cudf::data_type{cudf::type_id::DECIMAL64, -elem.decimal_scale}; }
+    bool const is_date =
+      (elem.converted_type.has_value() && *elem.converted_type == cudf::io::parquet::ConvertedType::DATE) ||
+      (elem.logical_type.has_value() && elem.logical_type->type == cudf::io::parquet::LogicalType::DATE);
+    if (is_date) { return cudf::data_type{cudf::type_id::TIMESTAMP_DAYS}; }
+    if (elem.type == cudf::io::parquet::Type::INT32) { return cudf::data_type{cudf::type_id::INT32}; }
+    if (elem.type == cudf::io::parquet::Type::INT64) { return cudf::data_type{cudf::type_id::INT64}; }
+    if (elem.type == cudf::io::parquet::Type::BYTE_ARRAY) { return cudf::data_type{cudf::type_id::STRING}; }
+  }
+  csd_fail("column " + name + " has no schema type the scan engine supports");
+}
+
+/// The chunk of @p name in @p row_group, and its engine job fields.
+csd::ChunkJob csd_chunk_job(FileMetaData const& footer, cudf::size_type row_group, std::string const& name,
+                            std::uint32_t chunk_id, bool predicate, ColumnChunk const** chunk_out)
+{
+  auto const& rg = footer.row_groups[static_cast<std::size_t>(row_group)];
+  auto const it  = std::find_if(rg.columns.begin(), rg.columns.end(), [&](ColumnChunk const& chunk) {
+    return chunk.meta_data.path_in_schema.size() == 1 && chunk.meta_data.path_in_schema.front() == name;
+  });
+  if (it == rg.columns.end()) { csd_fail("row group has no chunk of " + name); }
+  auto const& meta   = it->meta_data;
+  auto const element = std::find_if(footer.schema.begin(), footer.schema.end(),
+                                    [&](auto const& elem) { return elem.name == name; });
+  csd::ChunkJob job;
+  job.chunk_id  = chunk_id;
+  job.row_group = static_cast<std::uint32_t>(row_group);
+  job.rows      = static_cast<std::uint64_t>(rg.num_rows);
+  switch (meta.type) {
+    case cudf::io::parquet::Type::INT32: job.type = csd::PhysicalType::INT32; break;
+    case cudf::io::parquet::Type::INT64: job.type = csd::PhysicalType::INT64; break;
+    case cudf::io::parquet::Type::BYTE_ARRAY: job.type = csd::PhysicalType::BYTE_ARRAY; break;
+    default: csd_fail("physical type of " + name + " is outside the scan engine");
+  }
+  if (meta.codec != cudf::io::parquet::Compression::UNCOMPRESSED &&
+      meta.codec != cudf::io::parquet::Compression::SNAPPY) {
+    csd_fail("codec of " + name + " is outside the scan engine");
+  }
+  job.snappy = meta.codec == cudf::io::parquet::Compression::SNAPPY;
+  job.max_definition_level =
+    (element != footer.schema.end() && element->repetition_type == cudf::io::parquet::FieldRepetitionType::OPTIONAL)
+      ? 1
+      : 0;
+  job.file_offset = static_cast<std::uint64_t>(chunk_start_offset(meta));
+  job.bytes       = static_cast<std::uint64_t>(meta.total_compressed_size);
+  job.predicate   = predicate;
+  *chunk_out      = &*it;
+  return job;
+}
+
+/// Open the eight cards once per process. Marked as start-up work (`gsb::init::`), like cuFile's driver open.
+void csd_fpga_open_once()
+{
+  static std::once_flag opened;
+  std::call_once(opened, [] {
+    nvtx_scoped_range const range{"gsb::init::csd_fpga_open"};
+    csd::Runtime::Options options;
+    options.xclbin_path          = required_env("FLOWCSD_CSD_XCLBIN");
+    options.register_host_memory = [](void* data, std::size_t bytes) {
+      auto const status = cudaHostRegister(data, bytes, cudaHostRegisterDefault);
+      if (status != cudaSuccess) {
+        csd_fail(std::string("cudaHostRegister of CSD output memory: ") + cudaGetErrorString(status));
+      }
+    };
+    std::ignore = csd::Runtime::open(options);
+  });
+}
+
+/// One file's engine output, staged in device memory, with its index.
+struct csd_file_output {
+  rmm::device_buffer main;   ///< main data beats
+  rmm::device_buffer chars;  ///< chars data beats
+  std::vector<csd::IndexRecord> index;
+  std::unordered_map<std::uint32_t, std::size_t> column_of_chunk;  ///< projected chunk id -> unique column
+};
+
+void check_cuda(cudaError_t status, char const* what)
+{
+  if (status != cudaSuccess) { csd_fail(std::string(what) + ": " + cudaGetErrorString(status)); }
+}
+
+}  // namespace
+
+bool csd_fpga_enabled() noexcept
+{
+  char const* env = std::getenv("FLOWCSD_CSD_FPGA");
+  return env != nullptr && std::string_view(env) == "1";
+}
+
+bool csd_is_gpu_string_filter_scan(std::string const& table_name) noexcept
+{
+  char const* raw = std::getenv("FLOWCSD_QUERY");
+  if (raw == nullptr) { return false; }
+  std::string query(raw);
+  if (query.size() == 2 && query[0] == 'q') { query = "q0" + query.substr(1); }
+  return (query == "q09" && table_name == "part") || (query == "q13" && table_name == "orders") ||
+         (query == "q16" && table_name == "supplier") || (query == "q20" && table_name == "part");
+}
+
+std::unique_ptr<cudf::table> materialize_csd_fpga(std::span<parquet_source const> sources,
+                                                  std::vector<std::string> const& target_column_names,
+                                                  ::cuda::stream_ref stream,
+                                                  rmm::device_async_resource_ref mr)
+{
+  if (sources.empty()) { return nullptr; }
+  require_same_parquet_schema(sources);
+  csd_fpga_open_once();
+
+  std::vector<std::string> unique_cols;
+  for (auto const& name : target_column_names) {
+    if (std::find(unique_cols.begin(), unique_cols.end(), name) == unique_cols.end()) { unique_cols.push_back(name); }
+  }
+  auto const table = std::filesystem::path(path_of(sources.front())).parent_path().filename().string();
+  auto const& predicates = csd_predicates(table, unique_cols);
+
+  // 1. Engine requests: per selected row group, predicate chunks in catalog order, then the projected columns.
+  std::vector<csd::FileScanRequest> requests(sources.size());
+  std::vector<csd_file_output> outputs(sources.size());
+  read_accounting accounting;
+  for (std::size_t s = 0; s < sources.size(); ++s) {
+    auto const& src    = sources[s];
+    auto const& footer = *src.metadata;
+    requests[s].path   = path_of(src);
+    std::uint32_t chunk_id = 0;
+    for (auto const rg : src.row_group_indices) {
+      csd::RowGroupJob job{static_cast<std::uint32_t>(rg),
+                           static_cast<std::uint64_t>(footer.row_groups[static_cast<std::size_t>(rg)].num_rows),
+                           {}};
+      std::vector<std::string> counted;
+      auto count_chunk = [&](ColumnChunk const* chunk, std::string const& name) {
+        if (std::find(counted.begin(), counted.end(), name) != counted.end()) { return; }
+        counted.push_back(name);
+        auto const pages = data_page_count(chunk->meta_data);
+        accounting.add_chunk(*chunk, 0, static_cast<std::uint64_t>(chunk->meta_data.total_compressed_size), pages,
+                             pages);
+      };
+      for (auto const& [name, intervals] : predicates) {
+        ColumnChunk const* chunk = nullptr;
+        job.chunks.push_back(csd_chunk_job(footer, rg, name, chunk_id++, true, &chunk));
+        job.chunks.back().intervals = intervals;
+        count_chunk(chunk, name);
+      }
+      for (std::size_t u = 0; u < unique_cols.size(); ++u) {
+        ColumnChunk const* chunk = nullptr;
+        outputs[s].column_of_chunk[chunk_id] = u;
+        job.chunks.push_back(csd_chunk_job(footer, rg, unique_cols[u], chunk_id++, false, &chunk));
+        count_chunk(chunk, unique_cols[u]);
+      }
+      requests[s].row_groups.push_back(std::move(job));
+    }
+  }
+
+  // 2. File scans on the cards, several at a time. Each output goes to device memory at once so its card buffer set
+  //    is free again before the split's other files need it.
+  std::atomic<std::size_t> next{0};
+  std::exception_ptr first_error;
+  std::mutex error_mutex;
+  auto worker = [&] {
+    cudaEvent_t copied{};
+    check_cuda(cudaEventCreateWithFlags(&copied, cudaEventDisableTiming), "cudaEventCreate");
+    for (std::size_t s = next++; s < sources.size(); s = next++) {
+      try {
+        auto const result = csd::Runtime::get().scan(requests[s]);
+        nvtx_scoped_range const range{"flowcsd::csd_host_to_gpu"};
+        auto const main_bytes  = result->stats().main_data_beats * 64;
+        auto const chars_bytes = result->stats().chars_data_beats * 64;
+        outputs[s].main        = rmm::device_buffer(main_bytes, stream, mr);
+        outputs[s].chars       = rmm::device_buffer(chars_bytes, stream, mr);
+        if (main_bytes) {
+          check_cuda(cudaMemcpyAsync(outputs[s].main.data(), result->main(), main_bytes, cudaMemcpyHostToDevice,
+                                     stream.get()),
+                     "main output copy");
+        }
+        if (chars_bytes) {
+          check_cuda(cudaMemcpyAsync(outputs[s].chars.data(), result->chars(), chars_bytes, cudaMemcpyHostToDevice,
+                                     stream.get()),
+                     "chars output copy");
+        }
+        // The pinned card buffers go back to the runtime when `result` dies; wait for the copies first.
+        check_cuda(cudaEventRecord(copied, stream.get()), "cudaEventRecord");
+        check_cuda(cudaEventSynchronize(copied), "cudaEventSynchronize");
+        outputs[s].index = result->index();
+      } catch (...) {
+        std::lock_guard const lock(error_mutex);
+        if (!first_error) { first_error = std::current_exception(); }
+      }
+    }
+    cudaEventDestroy(copied);
+  };
+  {
+    std::vector<std::thread> workers;
+    auto const count = std::min(sources.size(), CSD_MAX_FILE_WORKERS);
+    for (std::size_t w = 0; w < count; ++w) { workers.emplace_back(worker); }
+    for (auto& thread : workers) { thread.join(); }
+  }
+  if (first_error) { std::rethrow_exception(first_error); }
+
+  // 3. Output sizes per column, and one region copy per projected chunk.
+  auto const& footer = *sources.front().metadata;
+  std::vector<cudf::data_type> types;
+  for (auto const& name : unique_cols) { types.push_back(csd_cudf_type(footer, name)); }
+  std::vector<std::uint64_t> rows(unique_cols.size(), 0), chars(unique_cols.size(), 0);
+  struct placed_region {
+    std::size_t source, column;
+    csd::IndexRecord const* record;
+    std::uint64_t dst_row, dst_chars;
+  };
+  std::vector<placed_region> placed;
+  for (std::size_t s = 0; s < sources.size(); ++s) {
+    std::size_t seen = 0;
+    for (auto const& r : outputs[s].index) {
+      if (r.kind == csd::REGION_BITVECTOR) { continue; }
+      auto const found = outputs[s].column_of_chunk.find(r.chunk_id);
+      if (found == outputs[s].column_of_chunk.end()) { csd_fail("index names a chunk the request did not project"); }
+      auto const u    = found->second;
+      bool const text = types[u].id() == cudf::type_id::STRING;
+      if (r.kind == csd::REGION_DICT && (r.flags & csd::FLAG_PLAIN_VALUES)) {
+        csd_fail(unique_cols[u] + ": dictionary chunk with plain pages in " + path_of(sources[s]));
+      }
+      if (text ? !(r.kind == csd::REGION_STRING) : !(r.kind == csd::REGION_FIXED || r.kind == csd::REGION_DICT)) {
+        csd_fail(unique_cols[u] + ": region kind " + std::to_string(r.kind) + " does not fit its cuDF type");
+      }
+      if (!text && r.width != cudf::size_of(types[u])) {
+        csd_fail(unique_cols[u] + ": " + std::to_string(r.width) + "-byte values for a " +
+                 std::to_string(cudf::size_of(types[u])) + "-byte cuDF type");
+      }
+      placed.push_back({s, u, &r, rows[u], chars[u]});
+      rows[u] += r.elements;
+      chars[u] += r.chars_bytes;
+      ++seen;
+    }
+    if (seen != outputs[s].column_of_chunk.size()) { csd_fail("index lacks a projected chunk of " + path_of(sources[s])); }
+  }
+
+  for (std::size_t u = 0; u < unique_cols.size(); ++u) {
+    accounting.columns[unique_cols[u]].rows_decoded += static_cast<std::int64_t>(rows[u]);
+  }
+
+  // 4. Output buffers, region copies (one kernel), and string bytes (one device copy per region).
+  std::vector<rmm::device_buffer> data(unique_cols.size()), offsets(unique_cols.size());
+  for (std::size_t u = 0; u < unique_cols.size(); ++u) {
+    if (rows[u] >= std::uint64_t(std::numeric_limits<cudf::size_type>::max()) ||
+        chars[u] >= std::uint64_t(std::numeric_limits<std::int32_t>::max())) {
+      csd_fail(unique_cols[u] + " exceeds 32-bit cuDF row or string offsets");
+    }
+    if (types[u].id() == cudf::type_id::STRING) {
+      offsets[u] = rmm::device_buffer((rows[u] + 1) * sizeof(std::int32_t), stream, mr);
+      data[u]    = rmm::device_buffer(chars[u], stream, mr);
+      check_cuda(cudaMemsetAsync(offsets[u].data(), 0, sizeof(std::int32_t), stream.get()), "offsets[0]");
+    } else {
+      data[u] = rmm::device_buffer(rows[u] * cudf::size_of(types[u]), stream, mr);
+    }
+  }
+  std::vector<csd_region_copy> copies;
+  copies.reserve(placed.size());
+  for (auto const& p : placed) {
+    auto const& r        = *p.record;
+    auto const* main_ptr = static_cast<std::uint8_t const*>(outputs[p.source].main.data()) + r.main_offset;
+    bool const text      = types[p.column].id() == cudf::type_id::STRING;
+    if (text && r.chars_bytes) {
+      check_cuda(cudaMemcpyAsync(static_cast<std::uint8_t*>(data[p.column].data()) + p.dst_chars,
+                                 static_cast<std::uint8_t const*>(outputs[p.source].chars.data()) + r.chars_offset,
+                                 r.chars_bytes, cudaMemcpyDeviceToDevice, stream.get()),
+                 "string bytes copy");
+    }
+    copies.push_back({main_ptr, r.kind, r.width, r.elements, r.dict_entries,
+                      text ? offsets[p.column].data() : data[p.column].data(), p.dst_row,
+                      static_cast<std::int64_t>(p.dst_chars)});
+  }
+  if (!copies.empty()) {
+    rmm::device_buffer copies_device(copies.size() * sizeof(csd_region_copy), stream, mr);
+    check_cuda(cudaMemcpyAsync(copies_device.data(), copies.data(), copies_device.size(), cudaMemcpyHostToDevice,
+                               stream.get()),
+               "region descriptors copy");
+    launch_csd_region_copies(static_cast<csd_region_copy const*>(copies_device.data()), copies.size(),
+                             stream.get());
+    stream.sync();  // the descriptors (host and device) and staged outputs must outlive the kernel
+  }
+
+  // 5. Columns in target order; a repeated name is a copy of its first column.
+  std::vector<std::unique_ptr<cudf::column>> built(unique_cols.size());
+  for (std::size_t u = 0; u < unique_cols.size(); ++u) {
+    auto const n = static_cast<cudf::size_type>(rows[u]);
+    if (n == 0) {
+      built[u] = cudf::make_empty_column(types[u]);
+      continue;
+    }
+    if (types[u].id() == cudf::type_id::STRING) {
+      auto offsets_column = std::make_unique<cudf::column>(cudf::data_type{cudf::type_id::INT32}, n + 1,
+                                                           std::move(offsets[u]), rmm::device_buffer{}, 0);
+      built[u] = cudf::make_strings_column(n, std::move(offsets_column), std::move(data[u]), 0, rmm::device_buffer{});
+    } else {
+      built[u] = std::make_unique<cudf::column>(types[u], n, std::move(data[u]), rmm::device_buffer{}, 0);
+    }
+  }
+  std::vector<std::unique_ptr<cudf::column>> out_columns;
+  std::vector<std::optional<std::size_t>> first_position(unique_cols.size());
+  for (auto const& name : target_column_names) {
+    auto const u = static_cast<std::size_t>(
+      std::distance(unique_cols.begin(), std::find(unique_cols.begin(), unique_cols.end(), name)));
+    if (!first_position[u].has_value()) {
+      first_position[u] = out_columns.size();
+      out_columns.push_back(std::move(built[u]));
+    } else {
+      out_columns.push_back(std::make_unique<cudf::column>(out_columns[*first_position[u]]->view(), stream, mr));
+    }
+  }
+  auto out_table = std::make_unique<cudf::table>(std::move(out_columns));
+  record_scan_counters(accounting, sources, target_column_names, out_table->view(), stream);
+  return out_table;
 }
 
 }  // namespace sirius::op::scan

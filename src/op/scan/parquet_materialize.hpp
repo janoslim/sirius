@@ -166,4 +166,28 @@ class page_index_cache {
 /// this first.  Each source must have non-null metadata.
 void require_same_parquet_schema(std::span<parquet_source const> sources);
 
+// ---- Key Idea 1: Parquet scans on the eight SmartSSD FPGAs (flowcsd fork) ----
+//
+// Environment: FLOWCSD_CSD_FPGA=1 turns the route on; FLOWCSD_CSD_XCLBIN names the scan engine bitstream;
+// FLOWCSD_CSD_CATALOG names board/csd_scan_catalog.txt (per query and table: the single-column predicates the
+// engine evaluates); FLOWCSD_QUERY names the running query (q1..q22).
+
+/// True when Key Idea 1 is on ($FLOWCSD_CSD_FPGA=1).
+[[nodiscard]] bool csd_fpga_enabled() noexcept;
+
+/// True when the running query ($FLOWCSD_QUERY) filters @p table_name with a string LIKE/prefix predicate, which
+/// the GPU evaluates after the scan; the FPGA then scans that table unfiltered.
+[[nodiscard]] bool csd_is_gpu_string_filter_scan(std::string const& table_name) noexcept;
+
+/// Materialize @p sources on the SmartSSD FPGAs: each file's selected row groups are read from the file's own
+/// SmartSSD into the card's DRAM, decoded, filtered by the catalog predicates, and projected to the unique
+/// @p target_column_names there; the surviving rows are copied to the GPU, where one kernel places them into the
+/// output columns (dictionary codes looked up, string offsets rebased). Columns come back in
+/// @p target_column_names order, a repeated name as a copy. Throws on any engine error or format mismatch.
+[[nodiscard]] std::unique_ptr<cudf::table> materialize_csd_fpga(
+  std::span<parquet_source const> sources,
+  std::vector<std::string> const& target_column_names,
+  ::cuda::stream_ref stream,
+  rmm::device_async_resource_ref mr);
+
 }  // namespace sirius::op::scan

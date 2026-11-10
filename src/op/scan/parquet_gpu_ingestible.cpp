@@ -1669,6 +1669,39 @@ filtered_table parquet_gpu_ingestible::materialize_metadata_to_table(
   auto opts = *split.reader_options;
   if (all_slices_pruned) { opts.set_num_rows(0); }
 
+  // Key Idea 1: decode, filter, and project on the SmartSSD FPGAs; the four string-filter scans come back
+  // unfiltered with every scan column, so the GPU applies their LIKE/prefix residual as usual.
+  if (csd_fpga_enabled() && !all_slices_pruned) {
+    rmm::device_async_resource_ref mr_ref(mem_space.get_default_allocator());
+    std::vector<parquet_source> sources;
+    sources.reserve(split.rg_slices.size());
+    for (auto const& slice : split.rg_slices) {
+      sources.push_back(
+        parquet_source{slice.datasource, slice.file_metadata, slice.row_group_indices});
+      if (_info->profiles->counters) { _info->profiles->counters->reader_call(slice.file_path); }
+    }
+    auto const table_name =
+      std::filesystem::path(split.rg_slices.front().file_path).parent_path().filename().string();
+    bool const gpu_string_filter = csd_is_gpu_string_filter_scan(table_name);
+    std::vector<std::string> target_cols;
+    if (gpu_string_filter || _plan->output_layout.empty()) {
+      target_cols = _plan->data_column_names();
+    } else {
+      target_cols.reserve(_plan->output_layout.size());
+      for (auto const& entry : _plan->output_layout) {
+        target_cols.push_back(_plan->data_columns.at(entry.idx).name);
+      }
+    }
+    auto table = materialize_csd_fpga(sources, target_cols, stream, mr_ref);
+    for (auto const& slice : split.rg_slices) {
+      if (_info->profiles->counters) {
+        _info->profiles->counters->parquet_phase(slice.file_path, false);
+      }
+    }
+    auto const state = gpu_string_filter ? op::scan::filter_state::UNFILTERED
+                                         : op::scan::filter_state::ROW_FILTERED_AND_PROJECTED;
+    return op::scan::filtered_table{owning_table_view{std::move(table)}, state};
+  }
   // Per-task AST translation for reader-side row-group + row pushdown. set_filter
   // is gated on translation success AND on the per-batch disable_filter_pushdown
   // flag (set when the FLBA-decimal probe failed). When pushdown does not engage
