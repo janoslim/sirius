@@ -175,6 +175,10 @@ void require_same_parquet_schema(std::span<parquet_source const> sources);
 /// True when Key Idea 1 is on ($FLOWCSD_CSD_FPGA=1).
 [[nodiscard]] bool csd_fpga_enabled() noexcept;
 
+/// Open the eight SmartSSD FPGAs once per process: load the bitstream (a no-op when it is already programmed),
+/// allocate the card buffers, and pin the output memory. Sirius calls this at extension load; later calls return.
+void csd_fpga_open();
+
 /// True when the running query ($FLOWCSD_QUERY) filters @p table_name with a string LIKE/prefix predicate, which
 /// the GPU evaluates after the scan; the FPGA then scans that table unfiltered.
 [[nodiscard]] bool csd_is_gpu_string_filter_scan(std::string const& table_name) noexcept;

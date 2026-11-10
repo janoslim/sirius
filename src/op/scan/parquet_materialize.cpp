@@ -40,7 +40,9 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <exception>
 #include <filesystem>
@@ -1345,7 +1347,11 @@ void csd_fpga_open_once()
         csd_fail(std::string("cudaHostRegister of CSD output memory: ") + cudaGetErrorString(status));
       }
     };
-    std::ignore = csd::Runtime::open(options);
+    auto const started = std::chrono::steady_clock::now();
+    std::ignore        = csd::Runtime::open(options);
+    auto const ms =
+      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
+    std::fprintf(stderr, "[csd_fpga] opened 8 SmartSSD FPGAs (%s) in %.1f ms\n", options.xclbin_path.c_str(), ms);
   });
 }
 
@@ -1363,6 +1369,8 @@ void check_cuda(cudaError_t status, char const* what)
 }
 
 }  // namespace
+
+void csd_fpga_open() { csd_fpga_open_once(); }
 
 bool csd_fpga_enabled() noexcept
 {

@@ -103,6 +103,7 @@ extern "C" int cudaProfilerStop();
 #include "op/scan/duckdb_native_gpu_ingestible.hpp"
 #include "op/scan/gpu_ingestible.hpp"
 #include "op/scan/parquet_gpu_ingestible.hpp"
+#include "op/scan/parquet_materialize.hpp"
 #include "pin_table.hpp"
 #include "scan_manager/sirius_scan_manager.hpp"
 #include "sirius/duckdb.hpp"
@@ -3630,6 +3631,9 @@ static void LoadInternal(ExtensionLoader& loader)
     // Config parsing above must remain NVTX-free. initialize_context creates Quent
     // before resolving hardware or constructing any instrumented runtime objects.
     callback_ptr->initialize_context();
+    // Key Idea 1 (FLOWCSD_CSD_FPGA=1): open the eight SmartSSD FPGAs (bitstream, pinned output buffers) here, at
+    // load and before any query, like the GPU context above, so this start-up work stays out of the query time.
+    if (::sirius::op::scan::csd_fpga_enabled()) { ::sirius::op::scan::csd_fpga_open(); }
   }
   config.GetCallbackManager().Register(std::move(callback));
 
