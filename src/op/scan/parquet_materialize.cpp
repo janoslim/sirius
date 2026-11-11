@@ -1426,6 +1426,14 @@ csd::ChunkJob csd_chunk_job(FileMetaData const& footer, cudf::size_type row_grou
   return job;
 }
 
+/// True when Key Idea 2 is on ($FLOWCSD_CSD_COMPACT=1, with $FLOWCSD_CSD_FPGA=1): the engine sends compact tiles
+/// and the GPU unpacks them. Needs a bitstream built with the compact-tile transcoder.
+bool csd_compact_enabled() noexcept
+{
+  char const* env = std::getenv("FLOWCSD_CSD_COMPACT");
+  return env != nullptr && std::string_view(env) == "1";
+}
+
 /// Open the eight cards once per process. Marked as start-up work (`gsb::init::`), like cuFile's driver open.
 void csd_fpga_open_once()
 {
@@ -1434,6 +1442,8 @@ void csd_fpga_open_once()
     nvtx_scoped_range const range{"gsb::init::csd_fpga_open"};
     csd::Runtime::Options options;
     options.xclbin_path          = required_env("FLOWCSD_CSD_XCLBIN");
+    options.compact_tiles        = csd_compact_enabled();
+    if (options.compact_tiles) { csd_tile_decoder::initialize(); }
     options.register_host_memory = [](void* data, std::size_t bytes) {
       auto const status = cudaHostRegister(data, bytes, cudaHostRegisterDefault);
       if (status != cudaSuccess) {
@@ -1444,7 +1454,8 @@ void csd_fpga_open_once()
     std::ignore        = csd::Runtime::open(options);
     auto const ms =
       std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
-    std::fprintf(stderr, "[csd_fpga] opened 8 SmartSSD FPGAs (%s) in %.1f ms\n", options.xclbin_path.c_str(), ms);
+    std::fprintf(stderr, "[csd_fpga] opened 8 SmartSSD FPGAs (%s, compact tiles %s) in %.1f ms\n",
+                 options.xclbin_path.c_str(), options.compact_tiles ? "on" : "off", ms);
   });
 }
 
@@ -1459,6 +1470,124 @@ struct csd_file_output {
 void check_cuda(cudaError_t status, char const* what)
 {
   if (status != cudaSuccess) { csd_fail(std::string(what) + ": " + cudaGetErrorString(status)); }
+}
+
+/// One projected region of the split and where its rows start in its output column.
+struct csd_placed_region {
+  std::size_t source, column;
+  csd::IndexRecord const* record;
+  std::uint64_t dst_row, dst_chars;
+};
+
+/// Key Idea 2: unpack the compact regions of a split on the GPU into the output buffers of its columns. @p data
+/// (fixed-width columns) and @p offsets (string columns) are allocated by the caller; the chars buffers of string
+/// columns are allocated here, because their sizes are only known after the GPU sums the tiles' string lengths.
+void csd_decode_compact_regions(std::vector<csd_placed_region> const& placed,
+                                std::vector<csd_file_output> const& outputs,
+                                std::vector<cudf::data_type> const& types,
+                                std::vector<std::string> const& names,
+                                std::vector<rmm::device_buffer>& data,
+                                std::vector<rmm::device_buffer>& offsets,
+                                ::cuda::stream_ref stream,
+                                rmm::device_async_resource_ref mr)
+{
+  std::vector<csd_tile_region> regions;
+  regions.reserve(placed.size());
+  std::size_t tiles = 0;
+  auto add_region   = [&](csd_placed_region const& p, std::uint32_t string_column) {
+    auto const& r    = *p.record;
+    bool const text  = types[p.column].id() == cudf::type_id::STRING;
+    auto const* base = static_cast<std::uint8_t const*>(outputs[p.source].main.data()) + r.main_offset;
+    // A dictionary region starts with its entries (4 or 8 B each); the tiles follow.
+    std::uint64_t const dict_bytes = r.kind == csd::REGION_DICT ? std::uint64_t(r.dict_entries) * r.width : 0;
+    if (r.main_bytes < dict_bytes || r.chars_bytes != 0) { csd_fail(names[p.column] + ": malformed compact region"); }
+    csd_tile_region region;
+    region.tiles         = base + dict_bytes;
+    region.tile_bytes    = r.main_bytes - dict_bytes;
+    region.dict          = base;
+    region.dict_entries  = r.dict_entries;
+    region.kind          = r.kind;
+    region.width         = r.width;
+    region.elements      = r.elements;
+    region.first_tile    = tiles;
+    region.dst           = text ? offsets[p.column].data() : data[p.column].data();
+    region.dst_row       = p.dst_row;
+    region.string_column = string_column;
+    regions.push_back(region);
+    tiles += (r.elements + CSD_TILE_ROWS - 1) / CSD_TILE_ROWS;
+  };
+  // Tile list: the tiles of all fixed-width and dictionary regions, then the string tiles column by column, so the
+  // string tiles of one column are contiguous and their running byte sums give each tile's place in the column.
+  for (auto const& p : placed) {
+    if (types[p.column].id() != cudf::type_id::STRING) { add_region(p, 0); }
+  }
+  std::size_t const value_tiles = tiles;
+  std::vector<std::size_t> string_columns;       // unique-column index of each string column
+  std::vector<std::size_t> column_first_tiles;   // its first tile within the string tiles; then the string tile count
+  for (std::size_t u = 0; u < types.size(); ++u) {
+    if (types[u].id() != cudf::type_id::STRING) { continue; }
+    column_first_tiles.push_back(tiles - value_tiles);
+    for (auto const& p : placed) {
+      if (p.column == u) { add_region(p, static_cast<std::uint32_t>(string_columns.size())); }
+    }
+    string_columns.push_back(u);
+  }
+  column_first_tiles.push_back(tiles - value_tiles);
+  if (tiles >= std::uint64_t(std::numeric_limits<std::int32_t>::max())) { csd_fail("too many compact tiles in one split"); }
+
+  csd_tile_decoder decoder(regions.data(), regions.size(), value_tiles, tiles - value_tiles, stream, mr);
+  decoder.locate_tiles();
+  decoder.decode_value_tiles();
+  if (!string_columns.empty()) {
+    auto const bytes_before = decoder.string_bytes_before(column_first_tiles);
+    std::vector<csd_string_column> columns(string_columns.size());
+    for (std::size_t c = 0; c < string_columns.size(); ++c) {
+      auto const u     = string_columns[c];
+      auto const bytes = bytes_before[c + 1] - bytes_before[c];
+      if (bytes >= std::uint64_t(std::numeric_limits<std::int32_t>::max())) {
+        csd_fail(names[u] + " exceeds 32-bit cuDF string offsets");
+      }
+      data[u]    = rmm::device_buffer(bytes, stream, mr);
+      columns[c] = {static_cast<std::uint8_t*>(data[u].data()), bytes_before[c]};
+    }
+    decoder.decode_string_tiles(columns.data(), columns.size());
+  }
+  decoder.finish();  // synchronizes: the host descriptors and the staged outputs must outlive the kernels
+}
+
+/// Key Idea 1: place the plain regions of a split in the output buffers: one kernel for values, dictionary look-ups
+/// and string offsets, and one device copy of the string bytes per region.
+void csd_copy_plain_regions(std::vector<csd_placed_region> const& placed,
+                            std::vector<csd_file_output> const& outputs,
+                            std::vector<cudf::data_type> const& types,
+                            std::vector<rmm::device_buffer>& data,
+                            std::vector<rmm::device_buffer>& offsets,
+                            ::cuda::stream_ref stream,
+                            rmm::device_async_resource_ref mr)
+{
+  std::vector<csd_region_copy> copies;
+  copies.reserve(placed.size());
+  for (auto const& p : placed) {
+    auto const& r        = *p.record;
+    auto const* main_ptr = static_cast<std::uint8_t const*>(outputs[p.source].main.data()) + r.main_offset;
+    bool const text      = types[p.column].id() == cudf::type_id::STRING;
+    if (text && r.chars_bytes) {
+      check_cuda(cudaMemcpyAsync(static_cast<std::uint8_t*>(data[p.column].data()) + p.dst_chars,
+                                 static_cast<std::uint8_t const*>(outputs[p.source].chars.data()) + r.chars_offset,
+                                 r.chars_bytes, cudaMemcpyDeviceToDevice, stream.get()),
+                 "string bytes copy");
+    }
+    copies.push_back({main_ptr, r.kind, r.width, r.elements, r.dict_entries,
+                      text ? offsets[p.column].data() : data[p.column].data(), p.dst_row,
+                      static_cast<std::int64_t>(p.dst_chars)});
+  }
+  if (copies.empty()) { return; }
+  rmm::device_buffer copies_device(copies.size() * sizeof(csd_region_copy), stream, mr);
+  check_cuda(cudaMemcpyAsync(copies_device.data(), copies.data(), copies_device.size(), cudaMemcpyHostToDevice,
+                             stream.get()),
+             "region descriptors copy");
+  launch_csd_region_copies(static_cast<csd_region_copy const*>(copies_device.data()), copies.size(), stream.get());
+  stream.sync();  // the descriptors (host and device) and staged outputs must outlive the kernel
 }
 
 }  // namespace
@@ -1585,12 +1714,8 @@ std::unique_ptr<cudf::table> materialize_csd_fpga(std::span<parquet_source const
   std::vector<cudf::data_type> types;
   for (auto const& name : unique_cols) { types.push_back(csd_cudf_type(footer, name)); }
   std::vector<std::uint64_t> rows(unique_cols.size(), 0), chars(unique_cols.size(), 0);
-  struct placed_region {
-    std::size_t source, column;
-    csd::IndexRecord const* record;
-    std::uint64_t dst_row, dst_chars;
-  };
-  std::vector<placed_region> placed;
+  bool const compact = csd_compact_enabled();
+  std::vector<csd_placed_region> placed;
   for (std::size_t s = 0; s < sources.size(); ++s) {
     std::size_t seen = 0;
     for (auto const& r : outputs[s].index) {
@@ -1609,6 +1734,9 @@ std::unique_ptr<cudf::table> materialize_csd_fpga(std::span<parquet_source const
         csd_fail(unique_cols[u] + ": " + std::to_string(r.width) + "-byte values for a " +
                  std::to_string(cudf::size_of(types[u])) + "-byte cuDF type");
       }
+      if (((r.flags & csd::FLAG_COMPACT_TILES) != 0) != compact) {
+        csd_fail(unique_cols[u] + ": the region's compact-tile flag does not match FLOWCSD_CSD_COMPACT");
+      }
       placed.push_back({s, u, &r, rows[u], chars[u]});
       rows[u] += r.elements;
       chars[u] += r.chars_bytes;
@@ -1621,7 +1749,8 @@ std::unique_ptr<cudf::table> materialize_csd_fpga(std::span<parquet_source const
     accounting.columns[unique_cols[u]].rows_decoded += static_cast<std::int64_t>(rows[u]);
   }
 
-  // 4. Output buffers, region copies (one kernel), and string bytes (one device copy per region).
+  // 4. Output buffers and the regions' rows. Key Idea 2 unpacks compact tiles; Key Idea 1 copies plain regions (one
+  //    kernel) and string bytes (one device copy per region).
   std::vector<rmm::device_buffer> data(unique_cols.size()), offsets(unique_cols.size());
   for (std::size_t u = 0; u < unique_cols.size(); ++u) {
     if (rows[u] >= std::uint64_t(std::numeric_limits<cudf::size_type>::max()) ||
@@ -1630,36 +1759,17 @@ std::unique_ptr<cudf::table> materialize_csd_fpga(std::span<parquet_source const
     }
     if (types[u].id() == cudf::type_id::STRING) {
       offsets[u] = rmm::device_buffer((rows[u] + 1) * sizeof(std::int32_t), stream, mr);
-      data[u]    = rmm::device_buffer(chars[u], stream, mr);
+      // Compact tiles carry the string bytes, so their chars buffers are sized on the GPU.
+      if (!compact) { data[u] = rmm::device_buffer(chars[u], stream, mr); }
       check_cuda(cudaMemsetAsync(offsets[u].data(), 0, sizeof(std::int32_t), stream.get()), "offsets[0]");
     } else {
       data[u] = rmm::device_buffer(rows[u] * cudf::size_of(types[u]), stream, mr);
     }
   }
-  std::vector<csd_region_copy> copies;
-  copies.reserve(placed.size());
-  for (auto const& p : placed) {
-    auto const& r        = *p.record;
-    auto const* main_ptr = static_cast<std::uint8_t const*>(outputs[p.source].main.data()) + r.main_offset;
-    bool const text      = types[p.column].id() == cudf::type_id::STRING;
-    if (text && r.chars_bytes) {
-      check_cuda(cudaMemcpyAsync(static_cast<std::uint8_t*>(data[p.column].data()) + p.dst_chars,
-                                 static_cast<std::uint8_t const*>(outputs[p.source].chars.data()) + r.chars_offset,
-                                 r.chars_bytes, cudaMemcpyDeviceToDevice, stream.get()),
-                 "string bytes copy");
-    }
-    copies.push_back({main_ptr, r.kind, r.width, r.elements, r.dict_entries,
-                      text ? offsets[p.column].data() : data[p.column].data(), p.dst_row,
-                      static_cast<std::int64_t>(p.dst_chars)});
-  }
-  if (!copies.empty()) {
-    rmm::device_buffer copies_device(copies.size() * sizeof(csd_region_copy), stream, mr);
-    check_cuda(cudaMemcpyAsync(copies_device.data(), copies.data(), copies_device.size(), cudaMemcpyHostToDevice,
-                               stream.get()),
-               "region descriptors copy");
-    launch_csd_region_copies(static_cast<csd_region_copy const*>(copies_device.data()), copies.size(),
-                             stream.get());
-    stream.sync();  // the descriptors (host and device) and staged outputs must outlive the kernel
+  if (compact) {
+    csd_decode_compact_regions(placed, outputs, types, unique_cols, data, offsets, stream, mr);
+  } else {
+    csd_copy_plain_regions(placed, outputs, types, data, offsets, stream, mr);
   }
 
   // 5. Columns in target order; a repeated name is a copy of its first column.

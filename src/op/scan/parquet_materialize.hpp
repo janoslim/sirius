@@ -169,11 +169,13 @@ class page_index_cache {
 /// this first.  Each source must have non-null metadata.
 void require_same_parquet_schema(std::span<parquet_source const> sources);
 
-// ---- Key Idea 1: Parquet scans on the eight SmartSSD FPGAs (flowcsd fork) ----
+// ---- Key Idea 1 and 2: Parquet scans on the eight SmartSSD FPGAs (flowcsd fork) ----
 //
 // Environment: FLOWCSD_CSD_FPGA=1 turns the route on; FLOWCSD_CSD_XCLBIN names the scan engine bitstream;
 // FLOWCSD_CSD_CATALOG names board/csd_scan_catalog.txt (per query and table: the single-column predicates the
-// engine evaluates); FLOWCSD_QUERY names the running query (q1..q22).
+// engine evaluates); FLOWCSD_QUERY names the running query (q1..q22). FLOWCSD_CSD_COMPACT=1 adds Key Idea 2: the
+// engine (a bitstream built with the compact-tile transcoder) sends the surviving rows as compact tiles and the
+// GPU unpacks them.
 
 /// True when Key Idea 1 is on ($FLOWCSD_CSD_FPGA=1).
 [[nodiscard]] bool csd_fpga_enabled() noexcept;
@@ -189,8 +191,9 @@ void csd_fpga_open();
 /// Materialize @p sources on the SmartSSD FPGAs: each file's selected row groups are read from the file's own
 /// SmartSSD into the card's DRAM, decoded, filtered by the catalog predicates, and projected to the unique
 /// @p target_column_names there; the surviving rows are copied to the GPU, where one kernel places them into the
-/// output columns (dictionary codes looked up, string offsets rebased). Columns come back in
-/// @p target_column_names order, a repeated name as a copy. Throws on any engine error or format mismatch.
+/// output columns (dictionary codes looked up, string offsets rebased), or with Key Idea 2 the tile kernels unpack
+/// them into the output columns. Columns come back in @p target_column_names order, a repeated name as a copy.
+/// Throws on any engine error or format mismatch.
 [[nodiscard]] std::unique_ptr<cudf::table> materialize_csd_fpga(
   std::span<parquet_source const> sources,
   std::vector<std::string> const& target_column_names,

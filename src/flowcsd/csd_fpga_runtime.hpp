@@ -1,6 +1,7 @@
 /*
  * Host runtime of the eight mango SmartSSD FPGAs running the five-stage page core scan engine
- * (`fsc_engine_build.xclbin`: engine_feeder -> fsc_engine_kernel -> two engine_drain units), Key Idea 1.
+ * (`fsc_engine_build.xclbin`: engine_feeder -> fsc_engine_kernel -> two engine_drain units), Key Idea 1, and with
+ * `Options::compact_tiles` Key Idea 2 (projected chunks leave the engine as compact tiles).
  *
  * Purpose:
  *   Scan one Parquet file on the SmartSSD that stores it. The host reads the needed column chunks from the card's own
@@ -69,7 +70,14 @@ enum RegionKind : std::uint32_t {
   REGION_BITVECTOR = 4,  ///< row-group bit-vector, ceil(elements / 8) bytes
 };
 
-enum RegionFlag : std::uint32_t { FLAG_PLAIN_VALUES = 1, FLAG_DICT_CODES = 2, FLAG_DICTIONARY = 4 };
+enum RegionFlag : std::uint32_t {
+  FLAG_PLAIN_VALUES  = 1,
+  FLAG_DICT_CODES    = 2,
+  FLAG_DICTIONARY    = 4,
+  /// Key Idea 2: after the dictionary entries (if any) the region holds compact tiles, not values or offsets;
+  /// `elements` is the tiles' row count and string bytes are inside the tiles (no chars bytes).
+  FLAG_COMPACT_TILES = 8,
+};
 
 /// One region of the output, as the engine's 64-byte index record describes it.
 struct IndexRecord {
@@ -126,6 +134,10 @@ class Runtime {
   struct Options {
     std::string xclbin_path;                         ///< the engine bitstream (already programmed or loaded here)
     unsigned slots_per_card       = 4;
+    /// Key Idea 2: ask for compact tiles (job header mode 2) and write the static FSST symbol table
+    /// (csd_fsst_static_table.hpp) into the transcoder before every scan. Needs a bitstream built with the
+    /// transcoder; a Key Idea 1 bitstream answers with an engine error code.
+    bool compact_tiles            = false;
     // Sizes cover every SF100 Q1-Q22 file scan: the largest input is 143,269,888 B (customer) and the largest chars
     // output 130,509,632 B (q10 customer); 128 MiB input and 64 MiB chars slots failed 81 of 7,709 file scans in the
     // 2026-11-11 board check. Per card: 4 x (256 + 128 + 256) MiB = 2.5 GiB of the 4 GiB DRAM (P2P BAR is 8 GiB).
