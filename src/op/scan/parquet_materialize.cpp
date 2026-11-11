@@ -1442,8 +1442,10 @@ void csd_fpga_open_once()
     nvtx_scoped_range const range{"gsb::init::csd_fpga_open"};
     csd::Runtime::Options options;
     options.xclbin_path          = required_env("FLOWCSD_CSD_XCLBIN");
-    options.compact_tiles        = csd_compact_enabled();
-    if (options.compact_tiles) { csd_tile_decoder::initialize(); }
+    if (csd_compact_enabled()) {
+      options.use_compact_tiles();
+      csd_tile_decoder::initialize();
+    }
     options.register_host_memory = [](void* data, std::size_t bytes) {
       auto const status = cudaHostRegister(data, bytes, cudaHostRegisterDefault);
       if (status != cudaSuccess) {

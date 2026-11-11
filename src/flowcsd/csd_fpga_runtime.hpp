@@ -136,7 +136,7 @@ class Runtime {
     unsigned slots_per_card       = 4;
     /// Key Idea 2: ask for compact tiles (job header mode 2) and write the static FSST symbol table
     /// (csd_fsst_static_table.hpp) into the transcoder before every scan. Needs a bitstream built with the
-    /// transcoder; a Key Idea 1 bitstream answers with an engine error code.
+    /// transcoder; a Key Idea 1 bitstream answers with an engine error code. Set it with `use_compact_tiles()`.
     bool compact_tiles            = false;
     // Sizes cover every SF100 Q1-Q22 file scan: the largest input is 143,269,888 B (customer) and the largest chars
     // output 130,509,632 B (q10 customer); 128 MiB input and 64 MiB chars slots failed 81 of 7,709 file scans in the
@@ -144,6 +144,16 @@ class Runtime {
     std::uint64_t input_slot_bytes = 256ULL << 20;   ///< card DRAM for one file's chunk extents
     std::uint64_t main_slot_bytes  = 128ULL << 20;   ///< card DRAM and pinned host memory, power of two
     std::uint64_t chars_slot_bytes = 256ULL << 20;   ///< card DRAM and pinned host memory, power of two
+
+    /// Turn Key Idea 2 on with output slots that fit it: compact tiles carry the string bytes in the main stream
+    /// (largest SF100 Q1-Q22 file output 196,127,788 B, q10 customer, from the model run of the compact mode), and
+    /// the chars stream is left with dictionary strings only. The card total stays 4 x (256 + 256 + 128) MiB.
+    void use_compact_tiles()
+    {
+      compact_tiles    = true;
+      main_slot_bytes  = 256ULL << 20;
+      chars_slot_bytes = 128ULL << 20;
+    }
     /// Called once per pinned host buffer (for example cudaHostRegister) before XRT wraps it.
     std::function<void(void*, std::size_t)> register_host_memory;
   };
