@@ -47,16 +47,19 @@
 #include <exception>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iterator>
 #include <limits>
 #include <mutex>
 #include <optional>
+#include <span>
 #include <sstream>
 #include <stdexcept>
 #include <string>
 #include <thread>
 #include <tuple>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 
 namespace sirius::op::scan {
@@ -1242,6 +1245,99 @@ std::string current_flowcsd_query()
   return query;
 }
 
+/// Names of the OPTIONAL leaf columns in a footer's serialized schema (the FileMetaData `schema` list in Thrift
+/// compact encoding, as `parquet_metadata::original_schema` keeps it). Why not `FileMetaData::schema`:
+/// hybrid_scan_reader rewrites every REQUIRED field to OPTIONAL there, and a REQUIRED column has no definition
+/// levels in its pages, so the engine must be told the file's own repetition (a wrong level stalled the engine).
+std::unordered_set<std::string> csd_optional_columns(std::span<uint8_t const> schema)
+{
+  if (schema.empty()) { csd_fail("no serialized footer schema to read column repetition from"); }
+  std::size_t at = 0;
+  auto byte = [&]() -> uint8_t {
+    if (at >= schema.size()) { csd_fail("truncated serialized schema"); }
+    return schema[at++];
+  };
+  auto varint = [&]() -> uint64_t {
+    uint64_t value = 0;
+    for (unsigned shift = 0; shift < 64; shift += 7) {
+      auto const b = byte();
+      value |= uint64_t(b & 127) << shift;
+      if (!(b & 128)) { return value; }
+    }
+    csd_fail("invalid varint in serialized schema");
+  };
+  auto zigzag = [](uint64_t z) { return static_cast<int64_t>(z >> 1) ^ -static_cast<int64_t>(z & 1); };
+  // Skips one value of compact type `type` (field-header form for booleans when `in_field`).
+  std::function<void(unsigned, bool)> skip = [&](unsigned type, bool in_field) {
+    switch (type) {
+      case 1:
+      case 2: if (!in_field) { byte(); } return;
+      case 3: byte(); return;
+      case 4:
+      case 5:
+      case 6: varint(); return;
+      case 7: at += 8; return;
+      case 8: at += varint(); return;
+      case 9:
+      case 10: {
+        auto const header = byte();
+        uint64_t count    = header >> 4;
+        if (count == 15) { count = varint(); }
+        for (uint64_t i = 0; i < count; ++i) { skip(header & 15, false); }
+        return;
+      }
+      case 11: {
+        auto const count = varint();
+        if (count == 0) { return; }
+        auto const types = byte();
+        for (uint64_t i = 0; i < count; ++i) {
+          skip(types >> 4, false);
+          skip(types & 15, false);
+        }
+        return;
+      }
+      case 12:
+        for (;;) {
+          auto const field_header = byte();
+          if (field_header == 0) { return; }
+          if ((field_header >> 4) == 0) { varint(); }  // long-form field id
+          skip(field_header & 15, true);
+        }
+      default: csd_fail("invalid compact type in serialized schema");
+    }
+  };
+  // list<SchemaElement>: field 3 is repetition_type (1 = OPTIONAL), field 4 the name, field 5 num_children.
+  auto const header = byte();
+  uint64_t count    = header >> 4;
+  if (count == 15) { count = varint(); }
+  if ((header & 15) != 12) { csd_fail("serialized schema is not a list of structs"); }
+  std::unordered_set<std::string> optional;
+  for (uint64_t e = 0; e < count; ++e) {
+    int64_t repetition = 0, children = 0;
+    std::string name;
+    for (int64_t field = 0;;) {
+      auto const field_header = byte();
+      if (field_header == 0) { break; }
+      field = (field_header >> 4) ? field + (field_header >> 4) : zigzag(varint());
+      unsigned const type = field_header & 15;
+      if (field == 3 && type == 5) {
+        repetition = zigzag(varint());
+      } else if (field == 4 && type == 8) {
+        auto const length = varint();
+        if (length > schema.size() - at) { csd_fail("truncated name in serialized schema"); }
+        name.assign(reinterpret_cast<char const*>(schema.data() + at), length);
+        at += length;
+      } else if (field == 5 && type == 5) {
+        children = zigzag(varint());
+      } else {
+        skip(type, true);
+      }
+    }
+    if (e > 0 && children == 0 && repetition == 1) { optional.insert(name); }
+  }
+  return optional;
+}
+
 /// The catalog predicates of this query's scan of @p table. Scans of one table in one query share their predicates
 /// except Q22 customer, told apart by their projected columns; anything else ambiguous stops the query.
 std::vector<std::pair<std::string, std::vector<csd::Interval>>> const& csd_predicates(
@@ -1295,18 +1391,18 @@ cudf::data_type csd_cudf_type(FileMetaData const& footer, std::string const& nam
   csd_fail("column " + name + " has no schema type the scan engine supports");
 }
 
-/// The chunk of @p name in @p row_group, and its engine job fields.
+/// The chunk of @p name in @p row_group, and its engine job fields. @p optional_columns comes from the file's own
+/// serialized schema (`csd_optional_columns`): an OPTIONAL column's pages carry definition levels.
 csd::ChunkJob csd_chunk_job(FileMetaData const& footer, cudf::size_type row_group, std::string const& name,
-                            std::uint32_t chunk_id, bool predicate, ColumnChunk const** chunk_out)
+                            std::uint32_t chunk_id, bool predicate, std::unordered_set<std::string> const& optional_columns,
+                            ColumnChunk const** chunk_out)
 {
   auto const& rg = footer.row_groups[static_cast<std::size_t>(row_group)];
   auto const it  = std::find_if(rg.columns.begin(), rg.columns.end(), [&](ColumnChunk const& chunk) {
     return chunk.meta_data.path_in_schema.size() == 1 && chunk.meta_data.path_in_schema.front() == name;
   });
   if (it == rg.columns.end()) { csd_fail("row group has no chunk of " + name); }
-  auto const& meta   = it->meta_data;
-  auto const element = std::find_if(footer.schema.begin(), footer.schema.end(),
-                                    [&](auto const& elem) { return elem.name == name; });
+  auto const& meta = it->meta_data;
   csd::ChunkJob job;
   job.chunk_id  = chunk_id;
   job.row_group = static_cast<std::uint32_t>(row_group);
@@ -1322,10 +1418,7 @@ csd::ChunkJob csd_chunk_job(FileMetaData const& footer, cudf::size_type row_grou
     csd_fail("codec of " + name + " is outside the scan engine");
   }
   job.snappy = meta.codec == cudf::io::parquet::Compression::SNAPPY;
-  job.max_definition_level =
-    (element != footer.schema.end() && element->repetition_type == cudf::io::parquet::FieldRepetitionType::OPTIONAL)
-      ? 1
-      : 0;
+  job.max_definition_level = optional_columns.count(name) ? 1 : 0;
   job.file_offset = static_cast<std::uint64_t>(chunk_start_offset(meta));
   job.bytes       = static_cast<std::uint64_t>(meta.total_compressed_size);
   job.predicate   = predicate;
@@ -1412,6 +1505,7 @@ std::unique_ptr<cudf::table> materialize_csd_fpga(std::span<parquet_source const
     auto const& src    = sources[s];
     auto const& footer = *src.metadata;
     requests[s].path   = path_of(src);
+    auto const optional_columns = csd_optional_columns(src.original_schema);
     std::uint32_t chunk_id = 0;
     for (auto const rg : src.row_group_indices) {
       csd::RowGroupJob job{static_cast<std::uint32_t>(rg),
@@ -1427,14 +1521,14 @@ std::unique_ptr<cudf::table> materialize_csd_fpga(std::span<parquet_source const
       };
       for (auto const& [name, intervals] : predicates) {
         ColumnChunk const* chunk = nullptr;
-        job.chunks.push_back(csd_chunk_job(footer, rg, name, chunk_id++, true, &chunk));
+        job.chunks.push_back(csd_chunk_job(footer, rg, name, chunk_id++, true, optional_columns, &chunk));
         job.chunks.back().intervals = intervals;
         count_chunk(chunk, name);
       }
       for (std::size_t u = 0; u < unique_cols.size(); ++u) {
         ColumnChunk const* chunk = nullptr;
         outputs[s].column_of_chunk[chunk_id] = u;
-        job.chunks.push_back(csd_chunk_job(footer, rg, unique_cols[u], chunk_id++, false, &chunk));
+        job.chunks.push_back(csd_chunk_job(footer, rg, unique_cols[u], chunk_id++, false, optional_columns, &chunk));
         count_chunk(chunk, unique_cols[u]);
       }
       requests[s].row_groups.push_back(std::move(job));

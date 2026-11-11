@@ -474,6 +474,7 @@ class parquet_batch_coalescer : public batch_coalescer {
                              cur_comp,
                              std::move(slice_ds),
                              file->file_index);
+        _slices.back().original_schema = file->original_schema;
         auto certificate     = file->certificates().front();
         certificate.split_id = _next_split_id++;
         _certificates.push_back(std::move(certificate));
@@ -1677,7 +1678,7 @@ filtered_table parquet_gpu_ingestible::materialize_metadata_to_table(
     sources.reserve(split.rg_slices.size());
     for (auto const& slice : split.rg_slices) {
       sources.push_back(
-        parquet_source{slice.datasource, slice.file_metadata, slice.row_group_indices});
+        parquet_source{slice.datasource, slice.file_metadata, slice.row_group_indices, slice.original_schema});
       if (_info->profiles->counters) { _info->profiles->counters->reader_call(slice.file_path); }
     }
     auto const table_name =
@@ -1816,7 +1817,7 @@ filtered_table parquet_gpu_ingestible::materialize_metadata_to_table(
     sources.reserve(split.rg_slices.size());
     for (auto const& slice : split.rg_slices) {
       sources.push_back(
-        parquet_source{slice.datasource, slice.file_metadata, slice.row_group_indices});
+        parquet_source{slice.datasource, slice.file_metadata, slice.row_group_indices, slice.original_schema});
     }
     if (!all_slices_pruned && _info->profiles->counters)
       for (auto const& slice : split.rg_slices)

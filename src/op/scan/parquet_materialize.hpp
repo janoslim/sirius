@@ -54,6 +54,9 @@ struct parquet_source {
   std::shared_ptr<io::sirius_datasource> datasource;
   std::shared_ptr<cudf::io::parquet::FileMetaData const> metadata;
   std::vector<cudf::size_type> row_group_indices;
+  /// The footer's serialized schema before hybrid_scan_reader rewrites REQUIRED fields to OPTIONAL in
+  /// @c metadata; the CSD FPGA path reads each column's repetition from it. Empty where nothing needs it.
+  std::span<uint8_t const> original_schema{};
 };
 
 /// Column-chunk byte ranges a read fetches for @p row_group_indices, honoring

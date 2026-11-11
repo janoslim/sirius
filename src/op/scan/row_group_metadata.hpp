@@ -26,6 +26,7 @@
 
 // standard library
 #include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <vector>
@@ -74,6 +75,9 @@ struct row_group_slice {
   std::shared_ptr<io::sirius_datasource> datasource;
   /// Stable position in DuckDB's bound file list.
   std::size_t file_index;
+  /// The footer's serialized schema (`parquet_metadata::original_schema`), before hybrid_scan_reader rewrites
+  /// REQUIRED fields to OPTIONAL; the CSD FPGA path reads each column's repetition from it.
+  std::vector<uint8_t> original_schema;
 };
 
 //===----------------------------------------------------------------------===//
