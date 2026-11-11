@@ -29,6 +29,7 @@
 #include <cerrno>
 #include <chrono>
 #include <condition_variable>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -71,6 +72,28 @@ std::uint64_t now_ns()
   timespec ts{};
   clock_gettime(CLOCK_MONOTONIC, &ts);
   return std::uint64_t(ts.tv_sec) * 1000000000ULL + std::uint64_t(ts.tv_nsec);
+}
+
+/// @p request in the verification plan format (gpu-smartssd-olap `fpga-offloading/five-stage-page-core/rtl/sim`
+/// harness `--plan`), so a failed board run can be replayed in Verilator. Columns are named by chunk id.
+std::string request_as_plan(FileScanRequest const& request)
+{
+  std::string text = "# failed board run\nfile " + request.path + "\n";
+  for (auto const& rg : request.row_groups) {
+    text += "rowgroup_start " + std::to_string(rg.row_group) + " " + std::to_string(rg.rows) + "\n";
+    for (auto const& c : rg.chunks) {
+      char const* type = c.type == PhysicalType::INT32 ? "INT32" : (c.type == PhysicalType::INT64 ? "INT64" : "BYTE_ARRAY");
+      text += "chunk " + std::to_string(c.chunk_id) + " " + std::to_string(c.row_group) + " " + std::to_string(c.rows) +
+              " chunk" + std::to_string(c.chunk_id) + " " + type + (c.snappy ? " SNAPPY " : " UNCOMPRESSED ") +
+              std::to_string(c.max_definition_level) + " " + std::to_string(c.file_offset) + " " +
+              std::to_string(c.bytes) + (c.predicate ? " predicate " : " project ") +
+              std::to_string(c.intervals.size());
+      for (auto const& iv : c.intervals) { text += " " + std::to_string(iv.low) + " " + std::to_string(iv.high); }
+      text += "\n";
+    }
+    text += "rowgroup_end " + std::to_string(rg.row_group) + " " + std::to_string(rg.rows) + "\n";
+  }
+  return text;
 }
 
 /// NVTX push/pop on the calling thread (global domain, the names the time attribution matches).
@@ -448,10 +471,17 @@ std::unique_ptr<FileScanResult> Runtime::scan(FileScanRequest const& request)
     slot.chars_drain_run.start();
     slot.feeder_run.start();
     auto const timeout = std::chrono::milliseconds(KERNEL_TIMEOUT_MS);
-    if (slot.feeder_run.wait(timeout) != ERT_CMD_STATE_COMPLETED ||
-        slot.main_drain_run.wait(timeout) != ERT_CMD_STATE_COMPLETED ||
-        slot.chars_drain_run.wait(timeout) != ERT_CMD_STATE_COMPLETED) {
-      fail("engine run did not complete on card " + std::to_string(card_index) + " for " + request.path);
+    bool const feeder_done = slot.feeder_run.wait(timeout) == ERT_CMD_STATE_COMPLETED;
+    bool const main_done   = feeder_done && slot.main_drain_run.wait(timeout) == ERT_CMD_STATE_COMPLETED;
+    bool const chars_done  = main_done && slot.chars_drain_run.wait(timeout) == ERT_CMD_STATE_COMPLETED;
+    if (!chars_done) {
+      // Which side stalled tells input backpressure (feeder) from a missing end of output (drains).
+      std::string const stalled = !feeder_done ? "feeder" : (!main_done ? "main drain" : "chars drain");
+      std::fprintf(stderr, "[csd_fpga] %s did not complete on card %d (%u jobs, %llu input bytes); request:\n%s",
+                   stalled.c_str(), card_index, job_count, static_cast<unsigned long long>(input_bytes),
+                   request_as_plan(request).c_str());
+      fail("engine run did not complete on card " + std::to_string(card_index) + " (" + stalled + ") for " +
+           request.path);
     }
   }
   std::uint64_t const t2 = now_ns();
