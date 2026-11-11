@@ -126,9 +126,12 @@ class Runtime {
   struct Options {
     std::string xclbin_path;                         ///< the engine bitstream (already programmed or loaded here)
     unsigned slots_per_card       = 4;
-    std::uint64_t input_slot_bytes = 128ULL << 20;   ///< card DRAM for one file's chunk extents
+    // Sizes cover every SF100 Q1-Q22 file scan: the largest input is 143,269,888 B (customer) and the largest chars
+    // output 130,509,632 B (q10 customer); 128 MiB input and 64 MiB chars slots failed 81 of 7,709 file scans in the
+    // 2026-11-11 board check. Per card: 4 x (256 + 128 + 256) MiB = 2.5 GiB of the 4 GiB DRAM (P2P BAR is 8 GiB).
+    std::uint64_t input_slot_bytes = 256ULL << 20;   ///< card DRAM for one file's chunk extents
     std::uint64_t main_slot_bytes  = 128ULL << 20;   ///< card DRAM and pinned host memory, power of two
-    std::uint64_t chars_slot_bytes = 64ULL << 20;    ///< card DRAM and pinned host memory, power of two
+    std::uint64_t chars_slot_bytes = 256ULL << 20;   ///< card DRAM and pinned host memory, power of two
     /// Called once per pinned host buffer (for example cudaHostRegister) before XRT wraps it.
     std::function<void(void*, std::size_t)> register_host_memory;
   };
