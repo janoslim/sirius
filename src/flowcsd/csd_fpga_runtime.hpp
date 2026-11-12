@@ -146,15 +146,18 @@ class Runtime {
     std::uint64_t main_slot_bytes  = 128ULL << 20;   ///< card DRAM and pinned host memory, power of two
     std::uint64_t chars_slot_bytes = 256ULL << 20;   ///< card DRAM and pinned host memory, power of two
 
-    /// Turn Key Idea 2 on with output slots that fit both mode 2 (196 MB max, q10 customer) and mode 3 Len-BP+raw
-    /// (271 MB max, q10 customer): 512 MiB main + 16 MiB chars (dictionary strings only, < 1 MiB). Per card:
-    /// 4 x (256 + 512 + 16) MiB = 3,136 MiB (3.06 GiB) of the 4 GiB DRAM.
+    /// Turn Key Idea 2 on with output slots for the tile mode; compact tiles carry the string bytes in the main
+    /// stream and the chars stream is left with dictionary strings only.
+    ///   mode 2 (static FSST tiles): 256 MiB main + 128 MiB chars, the sizes the board checks ran with (largest
+    ///     SF100 Q1-Q22 file output 196,127,788 B, q10 customer, from the model run of that mode).
+    ///   mode 3 (Len-BP + raw tiles): 512 MiB main + 16 MiB chars. PROVISIONAL, NOT MEASURED: no SF100 model run
+    ///     of mode 3 exists yet. An output that does not fit stops the scan with an error (see `scan`).
     void use_compact_tiles(std::uint32_t mode = 2)
     {
       compact_tiles      = (mode != 0);
       compact_tiles_mode = mode;
-      main_slot_bytes    = 512ULL << 20;
-      chars_slot_bytes   = 16ULL << 20;
+      main_slot_bytes    = (mode == 3 ? 512ULL : 256ULL) << 20;
+      chars_slot_bytes   = (mode == 3 ? 16ULL : 128ULL) << 20;
     }
     /// Called once per pinned host buffer (for example cudaHostRegister) before XRT wraps it.
     std::function<void(void*, std::size_t)> register_host_memory;
