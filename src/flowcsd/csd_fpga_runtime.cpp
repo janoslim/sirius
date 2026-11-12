@@ -546,8 +546,11 @@ std::unique_ptr<FileScanResult> Runtime::scan(FileScanRequest const& request)
     if (slot.chars_summary_map[0] != s.chars_data_beats) { fail("chars stream beat count mismatch: " + request.path); }
     std::uint64_t const main_bytes  = (s.main_data_beats + s.index_records) * BEAT_BYTES;
     std::uint64_t const chars_bytes = s.chars_data_beats * BEAT_BYTES;
-    if (main_bytes > options.main_slot_bytes || chars_bytes > options.chars_slot_bytes) {
-      fail("engine output of " + request.path + " exceeds the output buffers (main " + std::to_string(main_bytes) +
+    // `>=`, not `>`: the burst drain (engine_io_kernels.cpp, 2026-11-12) writes whole 4 KiB bursts and pads the last
+    // one with zeros, so the padding must not reach past the buffer and wrap onto the first words. Buffer sizes
+    // are multiples of 4 KiB, so one free word after the data is enough.
+    if (main_bytes >= options.main_slot_bytes || chars_bytes >= options.chars_slot_bytes) {
+      fail("engine output of " + request.path + " does not fit the output buffers (main " + std::to_string(main_bytes) +
            " B, chars " + std::to_string(chars_bytes) + " B); the drain wrapped and overwrote it");
     }
     if (main_bytes) { slot.main_out.sync(XCL_BO_SYNC_BO_FROM_DEVICE, main_bytes, 0); }
