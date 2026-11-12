@@ -54,6 +54,7 @@ constexpr std::size_t SUMMARY_BYTES     = 2 * BEAT_BYTES;
 constexpr unsigned KERNEL_TIMEOUT_MS    = 60000;
 constexpr std::size_t MAX_INTERVALS     = 32;
 constexpr std::uint32_t COMPACT_TILES_STATIC_TABLE = 2;  // job header bits [145:144]: tiles with the static table
+constexpr std::uint32_t COMPACT_TILES_LEN_BP_RAW   = 3;  // job header bits [145:144]: loop-free Len-BP + raw tiles
 constexpr std::size_t NUM_CARDS         = 8;
 
 // FPGA user functions of /mnt/dpu-olap/lake8/d0..d7 (serials S6FWNG0R600092, -286, -208, -094, -203, -202, -287, -292).
@@ -200,10 +201,10 @@ void append_fsst_table_beats(std::vector<Beat>& words)
 /// Job words of one file (symbol-table beats for compact tiles, then headers and interval beats) and the number of
 /// words the feeder walks as jobs. The feeder forwards a symbol-table beat as one job word (its kind bits are 0).
 std::vector<Beat> build_job_words(FileScanRequest const& request, std::vector<Extent> const& extents,
-                                  bool compact_tiles, unsigned& job_count)
+                                  std::uint32_t compact_tiles_mode, unsigned& job_count)
 {
   std::vector<Beat> words;
-  if (compact_tiles) { append_fsst_table_beats(words); }
+  if (compact_tiles_mode == COMPACT_TILES_STATIC_TABLE) { append_fsst_table_beats(words); }
   job_count  = unsigned(words.size());
   bool first = true;
   auto header = [&](std::uint32_t kind, std::uint32_t row_group, std::uint64_t rows) {
@@ -213,7 +214,7 @@ std::vector<Beat> build_job_words(FileScanRequest const& request, std::vector<Ex
     set_bits(beat, 34, 32, rows);
     set_bits(beat, 142, 1, 1);              // emit output beats (Mode 1)
     set_bits(beat, 143, 1, first ? 1 : 0);  // reset the statistics at the first job
-    set_bits(beat, 144, 2, compact_tiles ? COMPACT_TILES_STATIC_TABLE : 0);
+    set_bits(beat, 144, 2, compact_tiles_mode);
     first = false;
     ++job_count;
     return beat;
@@ -432,7 +433,10 @@ std::unique_ptr<FileScanResult> Runtime::scan(FileScanRequest const& request)
          std::to_string(options.input_slot_bytes));
   }
   unsigned job_count = 0;
-  auto const job_words = build_job_words(request, extents, options.compact_tiles, job_count);
+  std::uint32_t const mode = options.compact_tiles_mode != 0
+                               ? options.compact_tiles_mode
+                               : (options.compact_tiles ? COMPACT_TILES_STATIC_TABLE : 0);
+  auto const job_words = build_job_words(request, extents, mode, job_count);
   if (job_words.size() * sizeof(Beat) > JOB_SLOT_BYTES) { fail("job words exceed the job buffer: " + request.path); }
 
   // 2. A free buffer set of the card.

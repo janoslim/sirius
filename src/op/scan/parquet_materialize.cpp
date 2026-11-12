@@ -1426,11 +1426,21 @@ csd::ChunkJob csd_chunk_job(FileMetaData const& footer, cudf::size_type row_grou
   return job;
 }
 
-/// True when Key Idea 2 is on ($FLOWCSD_CSD_COMPACT=1, with $FLOWCSD_CSD_FPGA=1): the engine sends compact tiles
-/// and the GPU unpacks them. Needs a bitstream built with the compact-tile transcoder.
-bool csd_compact_enabled() noexcept
+/// Compact-tile mode ($FLOWCSD_CSD_COMPACT=1|2 -> mode 2 static FSST; $FLOWCSD_CSD_COMPACT=3 -> mode 3 Len-BP+raw).
+std::uint32_t csd_compact_mode() noexcept
 {
   char const* env = std::getenv("FLOWCSD_CSD_COMPACT");
+  if (env == nullptr || *env == '\0' || std::string_view(env) == "0") { return 0; }
+  if (std::string_view(env) == "1" || std::string_view(env) == "2") { return 2; }
+  if (std::string_view(env) == "3") { return 3; }
+  return 0;
+}
+
+bool csd_compact_enabled() noexcept { return csd_compact_mode() != 0; }
+/// True when the bitstream has the in-CSD streaming string pattern matcher ($FLOWCSD_CSD_STRING_MATCHER=1).
+bool csd_string_matcher_enabled() noexcept
+{
+  char const* env = std::getenv("FLOWCSD_CSD_STRING_MATCHER");
   return env != nullptr && std::string_view(env) == "1";
 }
 
@@ -1442,8 +1452,9 @@ void csd_fpga_open_once()
     nvtx_scoped_range const range{"gsb::init::csd_fpga_open"};
     csd::Runtime::Options options;
     options.xclbin_path          = required_env("FLOWCSD_CSD_XCLBIN");
-    if (csd_compact_enabled()) {
-      options.use_compact_tiles();
+    auto const compact_mode      = csd_compact_mode();
+    if (compact_mode != 0) {
+      options.use_compact_tiles(compact_mode);
       csd_tile_decoder::initialize();
     }
     options.register_host_memory = [](void* data, std::size_t bytes) {
@@ -1456,8 +1467,8 @@ void csd_fpga_open_once()
     std::ignore        = csd::Runtime::open(options);
     auto const ms =
       std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
-    std::fprintf(stderr, "[csd_fpga] opened 8 SmartSSD FPGAs (%s, compact tiles %s) in %.1f ms\n",
-                 options.xclbin_path.c_str(), options.compact_tiles ? "on" : "off", ms);
+    std::fprintf(stderr, "[csd_fpga] opened 8 SmartSSD FPGAs (%s, compact mode %u, string matcher %s) in %.1f ms\n",
+                 options.xclbin_path.c_str(), compact_mode, csd_string_matcher_enabled() ? "on" : "off", ms);
   });
 }
 
@@ -1604,6 +1615,7 @@ bool csd_fpga_enabled() noexcept
 
 bool csd_is_gpu_string_filter_scan(std::string const& table_name) noexcept
 {
+  if (csd_string_matcher_enabled()) { return false; }
   char const* raw = std::getenv("FLOWCSD_QUERY");
   if (raw == nullptr) { return false; }
   std::string query(raw);
